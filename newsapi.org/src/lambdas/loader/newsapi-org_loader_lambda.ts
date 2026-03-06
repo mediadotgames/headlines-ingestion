@@ -1,14 +1,21 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { Client } from "pg";
 import { from as copyFrom } from "pg-copy-streams";
-import { pipeline } from "node:stream/promises";
-import { csvHeader } from "./shared/newsapi-orgArtifactSchema";
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
+import type { S3Event } from "aws-lambda";
+import { csvHeader } from "../../shared/newsapi-orgArtifactSchema";
 
 const DATABASE_URL = process.env.DATABASE_URL!;
-
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
+
+const s3 = new S3Client({});
 
 type Manifest = {
   ingestion_source: string;
@@ -20,6 +27,45 @@ type Manifest = {
 
 function truncateErrorMessage(msg: string, max = 2000): string {
   return msg.length <= max ? msg : msg.slice(0, max);
+}
+
+function parseS3RecordKey(rawKey: string): string {
+  return decodeURIComponent(rawKey.replace(/\+/g, " "));
+}
+
+async function s3GetText(bucket: string, key: string): Promise<string> {
+  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!resp.Body) {
+    throw new Error(`S3 GetObject returned empty body: s3://${bucket}/${key}`);
+  }
+  return await new Response(resp.Body as any).text();
+}
+
+async function s3DownloadToFile(
+  bucket: string,
+  key: string,
+  destPath: string,
+): Promise<void> {
+  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!resp.Body) {
+    throw new Error(`S3 GetObject returned empty body: s3://${bucket}/${key}`);
+  }
+
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+  const writeStream = fs.createWriteStream(destPath);
+  await pipeline(resp.Body as any, writeStream);
+}
+
+async function s3PutJson(bucket: string, key: string, obj: unknown): Promise<void> {
+  const body = JSON.stringify(obj, null, 2);
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentType: "application/json",
+    }),
+  );
 }
 
 async function setLoadStarted(
@@ -93,21 +139,6 @@ async function markRunFailed(
     `,
     [runId, ingestionSource, code, truncateErrorMessage(message)],
   );
-}
-
-function pickLatestRunDir(baseOutDir: string): string {
-  const runsRoot = path.join(baseOutDir, "ingestion_source=newsapi-org");
-  const names = fs
-    .readdirSync(runsRoot, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && d.name.startsWith("run_id="))
-    .map((d) => d.name)
-    .sort();
-
-  if (names.length === 0) {
-    throw new Error(`No run directories found under ${runsRoot}`);
-  }
-
-  return path.join(runsRoot, names[names.length - 1]);
 }
 
 async function copyCsvIntoTempTable(db: Client, csvPath: string) {
@@ -245,22 +276,27 @@ async function bulkUpsertFromTemp(
   };
 }
 
-async function main() {
-  const baseOutDir = path.join(process.cwd(), "out");
-  const runDir = pickLatestRunDir(baseOutDir);
+export const handler = async (event: S3Event) => {
+  const rec = event.Records?.[0];
+  if (!rec) throw new Error("No S3 records in event");
 
-  const manifestPath = path.join(runDir, "manifest.json");
-  const csvPath = path.join(runDir, "articles.csv");
-  const loadReportPath = path.join(runDir, "load_report.json");
+  const bucket = rec.s3.bucket.name;
+  const manifestKey = parseS3RecordKey(rec.s3.object.key);
 
-  console.log("Loading artifacts from:", runDir);
+  if (!manifestKey.endsWith("manifest.json")) {
+    console.log(`Ignoring non-manifest key: s3://${bucket}/${manifestKey}`);
+    return;
+  }
 
-  const manifest = JSON.parse(
-    fs.readFileSync(manifestPath, "utf8"),
-  ) as Manifest;
+  const manifestText = await s3GetText(bucket, manifestKey);
+  const manifest = JSON.parse(manifestText) as Manifest;
 
-  console.log("manifest.run_id:", manifest.run_id);
-  console.log("manifest.ingestion_source:", manifest.ingestion_source);
+  const runPrefix = manifestKey.replace(/manifest\.json$/, "");
+  const csvKey = `${runPrefix}articles.csv`;
+  const reportKey = `${runPrefix}load_report.json`;
+
+  const csvPath = path.join("/tmp", "articles.csv");
+  await s3DownloadToFile(bucket, csvKey, csvPath);
 
   const expectedHeader = csvHeader();
   const actualHeader = fs.readFileSync(csvPath, "utf8").split(/\r?\n/, 1)[0];
@@ -318,7 +354,8 @@ async function main() {
     const loadReport = {
       ingestion_source: manifest.ingestion_source,
       run_id: manifest.run_id,
-      artifacts_dir: runDir,
+      s3_bucket: bucket,
+      s3_prefix: runPrefix,
       load_started_at: loadStartedAtIso,
       rows_in_artifact: rowsInArtifact,
       rows_attempted: rowsAttempted,
@@ -331,14 +368,10 @@ async function main() {
       pipeline_status: "loaded",
     };
 
-    fs.writeFileSync(
-      loadReportPath,
-      JSON.stringify(loadReport, null, 2),
-      "utf8",
-    );
-    console.log("Load complete:", loadReportPath);
+    await s3PutJson(bucket, reportKey, loadReport);
+    console.log("Load complete:", reportKey);
   } catch (e: any) {
-    console.error(e);
+    console.error("Load failed:", e);
 
     try {
       await markRunFailed(
@@ -352,7 +385,7 @@ async function main() {
       console.error("Also failed to mark pipeline_runs as failed:", inner);
     }
 
-    process.exitCode = 1;
+    throw e;
   } finally {
     try {
       await db.query(`DROP TABLE IF EXISTS tmp_headlines_load`);
@@ -362,9 +395,4 @@ async function main() {
 
     await db.end().catch(() => {});
   }
-}
-
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+};

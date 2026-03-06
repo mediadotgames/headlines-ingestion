@@ -3,28 +3,26 @@ import fs from "node:fs";
 import path from "node:path";
 import { Client } from "pg";
 import { DateTime } from "luxon";
-import { csvHeader, toCsvRow } from "./shared/newsapi-orgArtifactSchema";
-
-/**
- * newsapi-org_collector.ts
- *
- * Canonical "USA day" policy:
- * - To ensure we don't miss anything published before midnight anywhere in the USA,
- *   we use Hawaii (Pacific/Honolulu) as the canonical timezone boundary.
- * - Each run collects the previous calendar day in Pacific/Honolulu.
- */
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { csvHeader, toCsvRow } from "../../shared/newsapi-orgArtifactSchema";
 
 const NEWSAPI_KEY = process.env.NEWSAPI_KEY!;
 const SOURCES = process.env.NEWSAPI_SOURCES!;
 const DATABASE_URL = process.env.DATABASE_URL!;
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET!;
+const ARTIFACT_PREFIX = process.env.ARTIFACT_PREFIX!; // e.g. newsapi.org/out
 
 if (!NEWSAPI_KEY) throw new Error("Missing NEWSAPI_KEY");
 if (!SOURCES) throw new Error("Missing NEWSAPI_SOURCES");
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
+if (!ARTIFACT_BUCKET) throw new Error("Missing ARTIFACT_BUCKET");
+if (!ARTIFACT_PREFIX) throw new Error("Missing ARTIFACT_PREFIX");
 
 const PAGE_SIZE = 100;
 const INGESTION_SOURCE = "newsapi-org";
 const CANON_TZ = "Pacific/Honolulu";
+
+const s3 = new S3Client({});
 
 type NewsApiArticle = {
   source: { id: string | null; name: string };
@@ -74,7 +72,7 @@ async function fetchBatch(fromIso: string, toIso: string): Promise<NewsApiOk> {
     headers: { "X-Api-Key": NEWSAPI_KEY },
   });
 
-  const json: NewsApiResponse = await res.json().catch(() => ({}) as any);
+  const json: NewsApiResponse = await res.json().catch(() => ({} as any));
 
   if (!res.ok) {
     throw new Error(`NewsAPI HTTP ${res.status}: ${JSON.stringify(json)}`);
@@ -201,7 +199,24 @@ function computeHonoluluWindowUtc(): {
   };
 }
 
-async function main() {
+async function uploadFile(
+  bucket: string,
+  key: string,
+  filePath: string,
+  contentType: string,
+) {
+  const body = await fs.promises.readFile(filePath);
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+    }),
+  );
+}
+
+export const handler = async () => {
   const {
     runIdUtc,
     windowFromUtc,
@@ -220,12 +235,7 @@ async function main() {
   console.log("canonical_tz:", CANON_TZ);
   console.log("run_id (UTC instant of Honolulu midnight):", run_id);
   console.log("window (UTC):", window_from, "->", window_to);
-  console.log(
-    "window (Honolulu local):",
-    window_from_local,
-    "->",
-    window_to_local,
-  );
+  console.log("window (Honolulu local):", window_from_local, "->", window_to_local);
   console.log("sources:", SOURCES);
 
   const useSSL = !DATABASE_URL.includes("localhost");
@@ -235,6 +245,24 @@ async function main() {
     ssl: useSSL ? { rejectUnauthorized: false } : false,
   });
   await db.connect();
+
+  const safeRunId = run_id.replace(/:/g, "-");
+  const tmpDir = path.join(
+    "/tmp",
+    "out",
+    `ingestion_source=${INGESTION_SOURCE}`,
+    `run_id=${safeRunId}`,
+  );
+  await fs.promises.mkdir(tmpDir, { recursive: true });
+
+  const jsonlPath = path.join(tmpDir, "articles.jsonl");
+  const csvPath = path.join(tmpDir, "articles.csv");
+  const manifestPath = path.join(tmpDir, "manifest.json");
+
+  const s3RunPrefix =
+    `${ARTIFACT_PREFIX.replace(/\/$/, "")}` +
+    `/ingestion_source=${INGESTION_SOURCE}` +
+    `/run_id=${safeRunId}`;
 
   try {
     await upsertPipelineRunStarted(db, {
@@ -299,18 +327,6 @@ async function main() {
       articlesDeduped: deduped.length,
     });
 
-    const outDir = path.join(
-      process.cwd(),
-      "out",
-      `ingestion_source=${INGESTION_SOURCE}`,
-      `run_id=${run_id.replace(/:/g, "-")}`,
-    );
-    fs.mkdirSync(outDir, { recursive: true });
-
-    const jsonlPath = path.join(outDir, "articles.jsonl");
-    const csvPath = path.join(outDir, "articles.csv");
-    const manifestPath = path.join(outDir, "manifest.json");
-
     const jsonl =
       deduped
         .map((a) =>
@@ -332,7 +348,7 @@ async function main() {
           }),
         )
         .join("\n") + "\n";
-    fs.writeFileSync(jsonlPath, jsonl, "utf8");
+    await fs.promises.writeFile(jsonlPath, jsonl, "utf8");
 
     const rows = deduped.map((a) =>
       toCsvRow({
@@ -348,7 +364,7 @@ async function main() {
       }),
     );
 
-    fs.writeFileSync(
+    await fs.promises.writeFile(
       csvPath,
       csvHeader() + "\n" + rows.join("\n") + "\n",
       "utf8",
@@ -377,8 +393,32 @@ async function main() {
       },
     };
 
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
-    console.log("wrote:", outDir);
+    await fs.promises.writeFile(
+      manifestPath,
+      JSON.stringify(manifest, null, 2),
+      "utf8",
+    );
+
+    await uploadFile(
+      ARTIFACT_BUCKET,
+      `${s3RunPrefix}/articles.jsonl`,
+      jsonlPath,
+      "application/x-ndjson",
+    );
+    await uploadFile(
+      ARTIFACT_BUCKET,
+      `${s3RunPrefix}/articles.csv`,
+      csvPath,
+      "text/csv",
+    );
+    await uploadFile(
+      ARTIFACT_BUCKET,
+      `${s3RunPrefix}/manifest.json`,
+      manifestPath,
+      "application/json",
+    );
+
+    console.log("uploaded to:", `s3://${ARTIFACT_BUCKET}/${s3RunPrefix}/`);
   } catch (e: any) {
     const msg = e?.message ? String(e.message) : String(e);
     console.error(e);
@@ -394,13 +434,8 @@ async function main() {
       console.error("Also failed to mark pipeline_runs as failed:", inner);
     }
 
-    process.exitCode = 1;
+    throw e;
   } finally {
     await db.end().catch(() => {});
   }
-}
-
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+};
