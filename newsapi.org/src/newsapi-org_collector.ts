@@ -6,12 +6,10 @@ import { DateTime } from "luxon";
 import { csvHeader, toCsvRow } from "./shared/newsapi-orgArtifactSchema";
 
 /**
- * newsapi-org_collector.ts
- *
  * Canonical "USA day" policy:
- * - To ensure we don't miss anything published before midnight anywhere in the USA,
- *   we use Hawaii (Pacific/Honolulu) as the canonical timezone boundary.
- * - Each run collects the previous calendar day in Pacific/Honolulu.
+ * - We use Hawaii (Pacific/Honolulu) as the canonical timezone boundary.
+ * - Each run collects the last 48 hours ending at Honolulu midnight.
+ * - This overlap helps catch late-indexed articles from NewsAPI.
  */
 
 const NEWSAPI_KEY = process.env.NEWSAPI_KEY!;
@@ -186,7 +184,7 @@ function computeHonoluluWindowUtc(): {
   windowToLocal: DateTime;
 } {
   const windowToLocal = DateTime.now().setZone(CANON_TZ).startOf("day");
-  const windowFromLocal = windowToLocal.minus({ days: 1 });
+  const windowFromLocal = windowToLocal.minus({ days: 2 });
 
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();

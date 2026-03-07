@@ -1,0 +1,32 @@
+{
+  "name": "newsapi.org",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build:lambda:loader": "esbuild src/lambdas/loader/newsapi-org_loader_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambdas/loader.js",
+    "build:lambda:collector": "esbuild src/lambdas/collector/newsapi-org_collector_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambdas/collector.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1003.0",
+    "dotenv": "^17.3.1",
+    "luxon": "^3.7.2",
+    "pg": "^8.20.0",
+    "pg-copy-streams": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.161",
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^25.3.4",
+    "@types/pg": "^8.18.0",
+    "@types/pg-copy-streams": "^1.2.5",
+    "esbuild": "^0.27.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
