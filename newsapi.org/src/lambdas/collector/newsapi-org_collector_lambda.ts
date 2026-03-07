@@ -6,6 +6,13 @@ import { DateTime } from "luxon";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { csvHeader, toCsvRow } from "../../shared/newsapi-orgArtifactSchema";
 
+/**
+ * Canonical "USA day" policy:
+ * - We use Hawaii (Pacific/Honolulu) as the canonical timezone boundary.
+ * - Each run collects the last 48 hours ending at Honolulu midnight.
+ * - This overlap helps catch late-indexed articles from NewsAPI.
+ */
+
 const NEWSAPI_KEY = process.env.NEWSAPI_KEY!;
 const SOURCES = process.env.NEWSAPI_SOURCES!;
 const DATABASE_URL = process.env.DATABASE_URL!;
@@ -72,7 +79,7 @@ async function fetchBatch(fromIso: string, toIso: string): Promise<NewsApiOk> {
     headers: { "X-Api-Key": NEWSAPI_KEY },
   });
 
-  const json: NewsApiResponse = await res.json().catch(() => ({} as any));
+  const json: NewsApiResponse = await res.json().catch(() => ({}) as any);
 
   if (!res.ok) {
     throw new Error(`NewsAPI HTTP ${res.status}: ${JSON.stringify(json)}`);
@@ -184,7 +191,7 @@ function computeHonoluluWindowUtc(): {
   windowToLocal: DateTime;
 } {
   const windowToLocal = DateTime.now().setZone(CANON_TZ).startOf("day");
-  const windowFromLocal = windowToLocal.minus({ days: 1 });
+  const windowFromLocal = windowToLocal.minus({ days: 2 });
 
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();
@@ -235,7 +242,12 @@ export const handler = async () => {
   console.log("canonical_tz:", CANON_TZ);
   console.log("run_id (UTC instant of Honolulu midnight):", run_id);
   console.log("window (UTC):", window_from, "->", window_to);
-  console.log("window (Honolulu local):", window_from_local, "->", window_to_local);
+  console.log(
+    "window (Honolulu local):",
+    window_from_local,
+    "->",
+    window_to_local,
+  );
   console.log("sources:", SOURCES);
 
   const useSSL = !DATABASE_URL.includes("localhost");
