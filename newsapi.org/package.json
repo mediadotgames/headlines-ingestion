@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build:lambda:loader": "esbuild src/lambdas/loader/newsapi-org_loader_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambdas/loader.js",
-    "build:lambda:collector": "esbuild src/lambdas/collector/newsapi-org_collector_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambdas/collector.js"
+    "build:lambda:loader": "esbuild src/lambda/loader/newsapi-org_loader_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambda/loader.js",
+    "build:lambda:collector": "esbuild src/lambda/collector/newsapi-org_collector_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambda/colector.js"
   },
   "keywords": [],
   "author": "",
