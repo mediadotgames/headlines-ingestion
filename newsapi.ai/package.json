@@ -4,9 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "build": "npx tsc",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build:lambda:loader": "esbuild src/lambdas/loader/newsapi-org_loader_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambdas/loader.js",
-    "build:lambda:collector": "esbuild src/lambdas/collector/newsapi-org_collector_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambdas/collector.js"
+    "build:lambda:collector:newsapi-ai": "esbuild src/lambda/collector/newsapi-ai_collector_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambda/newsapi-ai-collector.js",
+    "build:lambda:loader:newsapi-ai": "esbuild src/lambda/loader/newsapi-ai_loader_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambda/newsapi-ai-loader.js"
   },
   "keywords": [],
   "author": "",

@@ -183,8 +183,14 @@ async function countArtifactRows(db: Client) {
   };
 }
 
-async function bulkUpsertFromTemp(db: Client) {
-  const res = await db.query(`
+async function bulkUpsertFromTemp(
+  db: Client,
+  ingestionSource: string,
+  runId: string,
+  collectedAt: string,
+) {
+  const res = await db.query(
+    `
     WITH upserted AS (
       INSERT INTO public.newsapi_articles (
         uri,
@@ -206,7 +212,11 @@ async function bulkUpsertFromTemp(db: Client) {
         source,
         authors,
         sim,
-        wgt
+        wgt,
+        ingestion_source,
+        run_id,
+        collected_at,
+        ingested_at
       )
       SELECT
         NULLIF(uri, '') AS uri,
@@ -232,7 +242,11 @@ async function bulkUpsertFromTemp(db: Client) {
         NULLIF(source, '')::jsonb AS source,
         NULLIF(authors, '')::jsonb AS authors,
         NULLIF(sim, '')::double precision AS sim,
-        NULLIF(wgt, '')::bigint AS wgt
+        NULLIF(wgt, '')::bigint AS wgt,
+        $1 AS ingestion_source,
+        $2::timestamptz AS run_id,
+        $3::timestamptz AS collected_at,
+        now() AS ingested_at
       FROM tmp_newsapi_ai_load
       WHERE NULLIF(uri, '') IS NOT NULL
       ON CONFLICT (uri) DO UPDATE SET
@@ -255,6 +269,9 @@ async function bulkUpsertFromTemp(db: Client) {
         authors = EXCLUDED.authors,
         sim = EXCLUDED.sim,
         wgt = EXCLUDED.wgt,
+        ingestion_source = EXCLUDED.ingestion_source,
+        run_id = EXCLUDED.run_id,
+        collected_at = EXCLUDED.collected_at,
         updated_at = now()
       WHERE
         public.newsapi_articles.url IS DISTINCT FROM EXCLUDED.url OR
@@ -275,7 +292,10 @@ async function bulkUpsertFromTemp(db: Client) {
         public.newsapi_articles.source IS DISTINCT FROM EXCLUDED.source OR
         public.newsapi_articles.authors IS DISTINCT FROM EXCLUDED.authors OR
         public.newsapi_articles.sim IS DISTINCT FROM EXCLUDED.sim OR
-        public.newsapi_articles.wgt IS DISTINCT FROM EXCLUDED.wgt
+        public.newsapi_articles.wgt IS DISTINCT FROM EXCLUDED.wgt OR
+        public.newsapi_articles.ingestion_source IS DISTINCT FROM EXCLUDED.ingestion_source OR
+        public.newsapi_articles.run_id IS DISTINCT FROM EXCLUDED.run_id OR
+        public.newsapi_articles.collected_at IS DISTINCT FROM EXCLUDED.collected_at
       RETURNING (xmax = 0) AS inserted
     )
     SELECT
@@ -283,7 +303,9 @@ async function bulkUpsertFromTemp(db: Client) {
       COUNT(*) FILTER (WHERE inserted)::int AS db_rows_inserted,
       COUNT(*) FILTER (WHERE NOT inserted)::int AS db_rows_updated
     FROM upserted
-  `);
+    `,
+    [ingestionSource, runId, collectedAt],
+  );
 
   return {
     rowsLoaded: Number(res.rows[0].rows_loaded),
@@ -344,7 +366,12 @@ async function main() {
 
     const { rowsInArtifact, rowsAttempted } = await countArtifactRows(db);
     const { rowsLoaded, dbRowsInserted, dbRowsUpdated } =
-      await bulkUpsertFromTemp(db);
+      await bulkUpsertFromTemp(
+        db,
+        manifest.ingestion_source,
+        manifest.run_id,
+        manifest.collected_at,
+      );
 
     const dbRowsUnchanged = rowsAttempted - rowsLoaded;
     const loadCompletedAtIso = new Date().toISOString();
