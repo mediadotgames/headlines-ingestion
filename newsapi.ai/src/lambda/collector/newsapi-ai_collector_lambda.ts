@@ -4,14 +4,12 @@ import path from "node:path";
 import { Client } from "pg";
 import { DateTime } from "luxon";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { csvHeader, toCsvRow } from "../shared/newsapi-aiArtifactSchema";
+import { csvHeader, toCsvRow } from "../../shared/newsapi-aiArtifactSchema";
 
 /**
  * Canonical "USA day" policy:
  * - We use Hawaii (Pacific/Honolulu) as the canonical timezone boundary.
  * - Each run collects the last 48 hours ending at Honolulu midnight.
- * - The API only supports dateStart/dateEnd in YYYY-MM-DD, so we request a coarse
- *   date envelope and apply the exact timestamp window locally.
  */
 
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
@@ -19,9 +17,15 @@ const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
 const DATABASE_URL = process.env.DATABASE_URL!;
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET!;
 const ARTIFACT_PREFIX = process.env.ARTIFACT_PREFIX!;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS ?? 2);
+const WINDOW_END_DAYS_AGO = Number(process.env.WINDOW_END_DAYS_AGO ?? 0);
+const SEED_RUN = process.env.SEED_RUN === "true";
+const SEED_RUN_ID = "1900-01-01T00:00:00.000Z";
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
-if (!EVENTREGISTRY_SOURCE_URIS) throw new Error("Missing EVENTREGISTRY_SOURCE_URIS");
+if (!EVENTREGISTRY_SOURCE_URIS) {
+  throw new Error("Missing EVENTREGISTRY_SOURCE_URIS");
+}
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 if (!ARTIFACT_BUCKET) throw new Error("Missing ARTIFACT_BUCKET");
 if (!ARTIFACT_PREFIX) throw new Error("Missing ARTIFACT_PREFIX");
@@ -68,11 +72,13 @@ type NewsApiAiArticle = {
 };
 
 type EventRegistryResponse = {
-  articles?: {
-    results?: NewsApiAiArticle[];
-    pages?: number;
-    totalResults?: number;
-  } | NewsApiAiArticle[];
+  articles?:
+    | {
+        results?: NewsApiAiArticle[];
+        pages?: number;
+        totalResults?: number;
+      }
+    | NewsApiAiArticle[];
   results?: NewsApiAiArticle[];
   error?: unknown;
 };
@@ -94,8 +100,12 @@ function computeHonoluluWindowUtc(): {
   windowFromLocal: DateTime;
   windowToLocal: DateTime;
 } {
-  const windowToLocal = DateTime.now().setZone(CANON_TZ).startOf("day");
-  const windowFromLocal = windowToLocal.minus({ days: 2 });
+  const windowToLocal = DateTime.now()
+    .setZone(CANON_TZ)
+    .startOf("day")
+    .minus({ days: WINDOW_END_DAYS_AGO });
+
+  const windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
 
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();
@@ -108,10 +118,6 @@ function computeHonoluluWindowUtc(): {
     windowFromLocal,
     windowToLocal,
   };
-}
-
-function jsonString(value: unknown): string {
-  return JSON.stringify(value ?? null);
 }
 
 function parseArticleDateMs(article: NewsApiAiArticle): number | null {
@@ -142,26 +148,32 @@ async function fetchPage(args: {
   page: number;
   dateStart: string;
   dateEnd: string;
-}): Promise<NewsApiAiArticle[]> {
-  const res = await fetch("https://eventregistry.org/api/v1/article/getArticles", {
+}): Promise<{ articles: NewsApiAiArticle[]; raw: EventRegistryResponse }> {
+  const url = "https://eventregistry.org/api/v1/article/getArticles";
+
+  const body = {
+    apiKey: EVENTREGISTRY_API_KEY,
+    lang: "eng",
+    sourceUri: sourceUris,
+    dateStart: args.dateStart,
+    dateEnd: args.dateEnd,
+    articlesPage: args.page,
+    articlesSortBy: "date",
+    articlesSortByAsc: false,
+  };
+
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      apiKey: EVENTREGISTRY_API_KEY,
-      lang: "eng",
-      sourceUri: sourceUris,
-      dateStart: args.dateStart,
-      dateEnd: args.dateEnd,
-      articlesPage: args.page,
-      articlesSortBy: "date",
-      articlesSortByAsc: false,
-    }),
+    body: JSON.stringify(body),
   });
 
   const json = (await res.json().catch(() => ({}))) as EventRegistryResponse;
 
   if (!res.ok) {
-    throw new Error(`Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`);
+    throw new Error(
+      `Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`,
+    );
   }
 
   const errMsg = firstErrorMessage(json);
@@ -169,7 +181,7 @@ async function fetchPage(args: {
     throw new Error(`Event Registry error: ${errMsg}`);
   }
 
-  return extractArticles(json);
+  return { articles: extractArticles(json), raw: json };
 }
 
 async function upsertPipelineRunStarted(
@@ -282,6 +294,10 @@ async function uploadFile(
 
 export const handler = async () => {
   console.log("collector starting...");
+  console.log("NEWSAPI-AI COLLECTOR BUILD MARKER v2");
+  console.log("SEED_RUN:", SEED_RUN);
+  console.log("LOOKBACK_DAYS:", LOOKBACK_DAYS);
+  console.log("WINDOW_END_DAYS_AGO:", WINDOW_END_DAYS_AGO);
 
   const {
     runIdUtc,
@@ -291,7 +307,7 @@ export const handler = async () => {
     windowToLocal,
   } = computeHonoluluWindowUtc();
 
-  const run_id = isoOrThrow(runIdUtc, "run_id");
+  const run_id = SEED_RUN ? SEED_RUN_ID : isoOrThrow(runIdUtc, "run_id");
   const window_from = isoOrThrow(windowFromUtc, "window_from");
   const window_to = isoOrThrow(windowToUtc, "window_to");
   const window_from_local = isoOrThrow(windowFromLocal, "window_from_local");
@@ -299,6 +315,7 @@ export const handler = async () => {
 
   const date_start = windowFromUtc.toISODate();
   const date_end = windowToUtc.toISODate();
+
   if (!date_start || !date_end) {
     throw new Error("Failed to compute dateStart/dateEnd in YYYY-MM-DD format");
   }
@@ -307,7 +324,12 @@ export const handler = async () => {
   console.log("canonical_tz:", CANON_TZ);
   console.log("run_id (UTC instant of Honolulu midnight):", run_id);
   console.log("window (UTC):", window_from, "->", window_to);
-  console.log("window (Honolulu local):", window_from_local, "->", window_to_local);
+  console.log(
+    "window (Honolulu local):",
+    window_from_local,
+    "->",
+    window_to_local,
+  );
   console.log("source_uris:", sourceUris);
 
   const useSSL = !DATABASE_URL.includes("localhost");
@@ -345,12 +367,11 @@ export const handler = async () => {
 
     const hardFromMs = windowFromUtc.toMillis();
     const hardToMs = windowToUtc.toMillis();
-
     const byUri = new Map<string, NewsApiAiArticle>();
     let totalFetched = 0;
 
     for (let page = 1; page <= MAX_PAGES; page++) {
-      const articles = await fetchPage({
+      const { articles } = await fetchPage({
         page,
         dateStart: date_start,
         dateEnd: date_end,
@@ -381,17 +402,23 @@ export const handler = async () => {
 
       if (articles.length < PAGE_SIZE) break;
       if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
-        console.log("Stopping early because oldest article on a page crossed window_from");
+        console.log(
+          "Stopping early because oldest article on a page crossed window_from",
+        );
         break;
       }
     }
 
     if (byUri.size === 0) {
-      throw new Error("Collector fetched zero articles — aborting artifact write");
+      throw new Error(
+        "Collector fetched zero articles — aborting artifact write",
+      );
     }
 
     const deduped = Array.from(byUri.values());
-    deduped.sort((a, b) => (parseArticleDateMs(b) ?? 0) - (parseArticleDateMs(a) ?? 0));
+    deduped.sort(
+      (a, b) => (parseArticleDateMs(b) ?? 0) - (parseArticleDateMs(a) ?? 0),
+    );
 
     const collectedAt = new Date();
     const collected_at = collectedAt.toISOString();
@@ -445,7 +472,7 @@ export const handler = async () => {
         uri: a.uri == null ? "" : String(a.uri),
         url: a.url ?? "",
         title: a.title ?? "",
-        body: (a.body ?? "").replace(/\r?\n+/g, " "),
+        body: a.body ?? "",
         date: a.date ?? "",
         time: a.time ?? "",
         date_time: a.dateTime ?? "",
@@ -458,8 +485,8 @@ export const handler = async () => {
         relevance: a.relevance == null ? "" : String(a.relevance),
         story_uri: a.storyUri ?? "",
         image: a.image ?? "",
-        source: jsonString(a.source),
-        authors: jsonString(a.authors ?? []),
+        source: JSON.stringify(a.source ?? null),
+        authors: JSON.stringify(a.authors ?? []),
         sim: a.sim == null ? "" : String(a.sim),
         wgt: a.wgt == null ? "" : String(a.wgt),
       }),

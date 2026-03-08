@@ -8,6 +8,7 @@ console.log("collector starting...");
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
 const DATABASE_URL = process.env.DATABASE_URL!;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS ?? 2);
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
 if (!EVENTREGISTRY_SOURCE_URIS)
@@ -83,7 +84,7 @@ function computeHonoluluWindowUtc(): {
   windowToLocal: DateTime;
 } {
   const windowToLocal = DateTime.now().setZone(CANON_TZ).startOf("day");
-  const windowFromLocal = windowToLocal.minus({ days: 2 });
+  const windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
 
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();

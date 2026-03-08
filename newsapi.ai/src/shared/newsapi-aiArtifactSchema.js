@@ -2,7 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.csvHeader = csvHeader;
 exports.toCsvRow = toCsvRow;
-const HEADERS = [
+var HEADERS = [
     "uri",
     "url",
     "title",
@@ -29,10 +29,10 @@ function csvHeader() {
 }
 function escapeCsvCell(value) {
     if (/[",\n\r]/.test(value)) {
-        return `"${value.replace(/"/g, '""')}"`;
+        return "\"".concat(value.replace(/"/g, '""'), "\"");
     }
     return value;
 }
 function toCsvRow(row) {
-    return HEADERS.map((h) => escapeCsvCell(row[h] ?? "")).join(",");
+    return HEADERS.map(function (h) { var _a; return escapeCsvCell((_a = row[h]) !== null && _a !== void 0 ? _a : ""); }).join(",");
 }
