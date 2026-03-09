@@ -1,7 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.ARTIFACT_CONTRACT_VERSION = void 0;
 exports.csvHeader = csvHeader;
 exports.toCsvRow = toCsvRow;
+exports.ARTIFACT_CONTRACT_VERSION = "newsapi-ai/v2";
 var HEADERS = [
     "uri",
     "url",
@@ -23,6 +25,16 @@ var HEADERS = [
     "authors",
     "sim",
     "wgt",
+    "categories",
+    "concepts",
+    "links",
+    "videos",
+    "shares",
+    "duplicate_list",
+    "extracted_dates",
+    "location",
+    "original_article",
+    "raw_article",
 ];
 function csvHeader() {
     return HEADERS.join(",");

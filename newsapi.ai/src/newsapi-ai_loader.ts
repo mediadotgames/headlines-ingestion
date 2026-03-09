@@ -1,20 +1,45 @@
 import "dotenv/config";
-import fs from "node:fs";
-import path from "node:path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Client } from "pg";
 import { from as copyFrom } from "pg-copy-streams";
 import { pipeline } from "node:stream/promises";
-import { csvHeader } from "./shared/newsapi-aiArtifactSchema";
+import {
+  ARTIFACT_CONTRACT_VERSION,
+  csvHeader,
+} from "./shared/newsapi-aiArtifactSchema";
 
 const DATABASE_URL = process.env.DATABASE_URL!;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
 type Manifest = {
+  artifact_contract_version: string;
   ingestion_source: string;
   run_id: string;
   collected_at: string;
   window_from?: string;
   window_to?: string;
+};
+
+type ArtifactDiagnostics = {
+  rowsInArtifact: number;
+  minDateTimePublished: string | null;
+  maxDateTimePublished: string | null;
+  populatedCounts: {
+    source: number;
+    authors: number;
+    categories: number;
+    concepts: number;
+    links: number;
+    videos: number;
+    shares: number;
+    duplicate_list: number;
+    extracted_dates: number;
+    location: number;
+    original_article: number;
+    raw_article: number;
+  };
+  sampleUris: string[];
 };
 
 function truncateErrorMessage(msg: string, max = 2000): string {
@@ -131,8 +156,18 @@ async function copyCsvIntoTempTable(db: Client, csvPath: string) {
       source              text,
       authors             text,
       sim                 text,
-      wgt                 text
-    )
+      wgt                 text,
+      categories          text,
+      concepts            text,
+      links               text,
+      videos              text,
+      shares              text,
+      duplicate_list      text,
+      extracted_dates     text,
+      location            text,
+      original_article    text,
+      raw_article         text
+    ) ON COMMIT DROP
   `);
 
   const copySql = `
@@ -156,7 +191,17 @@ async function copyCsvIntoTempTable(db: Client, csvPath: string) {
       source,
       authors,
       sim,
-      wgt
+      wgt,
+      categories,
+      concepts,
+      links,
+      videos,
+      shares,
+      duplicate_list,
+      extracted_dates,
+      location,
+      original_article,
+      raw_article
     )
     FROM STDIN WITH (FORMAT csv, HEADER true)
   `;
@@ -180,6 +225,63 @@ async function countArtifactRows(db: Client) {
   return {
     rowsInArtifact: Number(totalRes.rows[0].n),
     rowsAttempted: Number(attemptedRes.rows[0].n),
+  };
+}
+
+async function collectArtifactDiagnostics(db: Client): Promise<ArtifactDiagnostics> {
+  const statsRes = await db.query(`
+    SELECT
+      COUNT(*)::int AS rows_in_artifact,
+      MIN(NULLIF(date_time_published, '')::timestamptz) AS min_date_time_published,
+      MAX(NULLIF(date_time_published, '')::timestamptz) AS max_date_time_published,
+
+      COUNT(*) FILTER (WHERE NULLIF(source, '') IS NOT NULL AND NULLIF(source, '') <> 'null')::int AS source_count,
+      COUNT(*) FILTER (WHERE NULLIF(authors, '') IS NOT NULL AND NULLIF(authors, '') <> 'null')::int AS authors_count,
+      COUNT(*) FILTER (WHERE NULLIF(categories, '') IS NOT NULL AND NULLIF(categories, '') <> 'null')::int AS categories_count,
+      COUNT(*) FILTER (WHERE NULLIF(concepts, '') IS NOT NULL AND NULLIF(concepts, '') <> 'null')::int AS concepts_count,
+      COUNT(*) FILTER (WHERE NULLIF(links, '') IS NOT NULL AND NULLIF(links, '') <> 'null')::int AS links_count,
+      COUNT(*) FILTER (WHERE NULLIF(videos, '') IS NOT NULL AND NULLIF(videos, '') <> 'null')::int AS videos_count,
+      COUNT(*) FILTER (WHERE NULLIF(shares, '') IS NOT NULL AND NULLIF(shares, '') <> 'null')::int AS shares_count,
+      COUNT(*) FILTER (WHERE NULLIF(duplicate_list, '') IS NOT NULL AND NULLIF(duplicate_list, '') <> 'null')::int AS duplicate_list_count,
+      COUNT(*) FILTER (WHERE NULLIF(extracted_dates, '') IS NOT NULL AND NULLIF(extracted_dates, '') <> 'null')::int AS extracted_dates_count,
+      COUNT(*) FILTER (WHERE NULLIF(location, '') IS NOT NULL AND NULLIF(location, '') <> 'null')::int AS location_count,
+      COUNT(*) FILTER (WHERE NULLIF(original_article, '') IS NOT NULL AND NULLIF(original_article, '') <> 'null')::int AS original_article_count,
+      COUNT(*) FILTER (WHERE NULLIF(raw_article, '') IS NOT NULL AND NULLIF(raw_article, '') <> 'null')::int AS raw_article_count
+    FROM tmp_newsapi_ai_load
+  `);
+
+  const sampleUrisRes = await db.query(`
+    SELECT uri
+    FROM tmp_newsapi_ai_load
+    WHERE NULLIF(uri, '') IS NOT NULL
+    ORDER BY uri
+    LIMIT 3
+  `);
+
+  const row = statsRes.rows[0];
+  return {
+    rowsInArtifact: Number(row.rows_in_artifact),
+    minDateTimePublished: row.min_date_time_published
+      ? new Date(row.min_date_time_published).toISOString()
+      : null,
+    maxDateTimePublished: row.max_date_time_published
+      ? new Date(row.max_date_time_published).toISOString()
+      : null,
+    populatedCounts: {
+      source: Number(row.source_count),
+      authors: Number(row.authors_count),
+      categories: Number(row.categories_count),
+      concepts: Number(row.concepts_count),
+      links: Number(row.links_count),
+      videos: Number(row.videos_count),
+      shares: Number(row.shares_count),
+      duplicate_list: Number(row.duplicate_list_count),
+      extracted_dates: Number(row.extracted_dates_count),
+      location: Number(row.location_count),
+      original_article: Number(row.original_article_count),
+      raw_article: Number(row.raw_article_count),
+    },
+    sampleUris: sampleUrisRes.rows.map((r) => String(r.uri)),
   };
 }
 
@@ -213,6 +315,16 @@ async function bulkUpsertFromTemp(
         authors,
         sim,
         wgt,
+        categories,
+        concepts,
+        links,
+        videos,
+        shares,
+        duplicate_list,
+        extracted_dates,
+        location,
+        original_article,
+        raw_article,
         ingestion_source,
         run_id,
         collected_at,
@@ -243,6 +355,16 @@ async function bulkUpsertFromTemp(
         NULLIF(authors, '')::jsonb AS authors,
         NULLIF(sim, '')::double precision AS sim,
         NULLIF(wgt, '')::bigint AS wgt,
+        NULLIF(categories, '')::jsonb AS categories,
+        NULLIF(concepts, '')::jsonb AS concepts,
+        NULLIF(links, '')::jsonb AS links,
+        NULLIF(videos, '')::jsonb AS videos,
+        NULLIF(shares, '')::jsonb AS shares,
+        NULLIF(duplicate_list, '')::jsonb AS duplicate_list,
+        NULLIF(extracted_dates, '')::jsonb AS extracted_dates,
+        NULLIF(location, '')::jsonb AS location,
+        NULLIF(original_article, '')::jsonb AS original_article,
+        NULLIF(raw_article, '')::jsonb AS raw_article,
         $1 AS ingestion_source,
         $2::timestamptz AS run_id,
         $3::timestamptz AS collected_at,
@@ -269,6 +391,16 @@ async function bulkUpsertFromTemp(
         authors = EXCLUDED.authors,
         sim = EXCLUDED.sim,
         wgt = EXCLUDED.wgt,
+        categories = EXCLUDED.categories,
+        concepts = EXCLUDED.concepts,
+        links = EXCLUDED.links,
+        videos = EXCLUDED.videos,
+        shares = EXCLUDED.shares,
+        duplicate_list = EXCLUDED.duplicate_list,
+        extracted_dates = EXCLUDED.extracted_dates,
+        location = EXCLUDED.location,
+        original_article = EXCLUDED.original_article,
+        raw_article = EXCLUDED.raw_article,
         ingestion_source = EXCLUDED.ingestion_source,
         run_id = EXCLUDED.run_id,
         collected_at = EXCLUDED.collected_at,
@@ -293,6 +425,16 @@ async function bulkUpsertFromTemp(
         public.newsapi_articles.authors IS DISTINCT FROM EXCLUDED.authors OR
         public.newsapi_articles.sim IS DISTINCT FROM EXCLUDED.sim OR
         public.newsapi_articles.wgt IS DISTINCT FROM EXCLUDED.wgt OR
+        public.newsapi_articles.categories IS DISTINCT FROM EXCLUDED.categories OR
+        public.newsapi_articles.concepts IS DISTINCT FROM EXCLUDED.concepts OR
+        public.newsapi_articles.links IS DISTINCT FROM EXCLUDED.links OR
+        public.newsapi_articles.videos IS DISTINCT FROM EXCLUDED.videos OR
+        public.newsapi_articles.shares IS DISTINCT FROM EXCLUDED.shares OR
+        public.newsapi_articles.duplicate_list IS DISTINCT FROM EXCLUDED.duplicate_list OR
+        public.newsapi_articles.extracted_dates IS DISTINCT FROM EXCLUDED.extracted_dates OR
+        public.newsapi_articles.location IS DISTINCT FROM EXCLUDED.location OR
+        public.newsapi_articles.original_article IS DISTINCT FROM EXCLUDED.original_article OR
+        public.newsapi_articles.raw_article IS DISTINCT FROM EXCLUDED.raw_article OR
         public.newsapi_articles.ingestion_source IS DISTINCT FROM EXCLUDED.ingestion_source OR
         public.newsapi_articles.run_id IS DISTINCT FROM EXCLUDED.run_id OR
         public.newsapi_articles.collected_at IS DISTINCT FROM EXCLUDED.collected_at
@@ -328,12 +470,19 @@ async function main() {
     fs.readFileSync(manifestPath, "utf8"),
   ) as Manifest;
 
+  if (manifest.artifact_contract_version !== ARTIFACT_CONTRACT_VERSION) {
+    throw new Error(
+      `Artifact contract mismatch. Expected ${ARTIFACT_CONTRACT_VERSION}, got ${manifest.artifact_contract_version}`,
+    );
+  }
+
   if (!manifest.collected_at) {
     throw new Error("Manifest missing collected_at — collector incomplete");
   }
 
   console.log("manifest.run_id:", manifest.run_id);
   console.log("manifest.ingestion_source:", manifest.ingestion_source);
+  console.log("manifest.artifact_contract_version:", manifest.artifact_contract_version);
 
   const expectedHeader = csvHeader();
   const actualHeader = fs.readFileSync(csvPath, "utf8").split(/\r?\n/, 1)[0];
@@ -355,6 +504,8 @@ async function main() {
   const startedMs = Date.now();
 
   try {
+    await db.query("BEGIN");
+
     await setLoadStarted(
       db,
       manifest.run_id,
@@ -364,6 +515,7 @@ async function main() {
 
     await copyCsvIntoTempTable(db, csvPath);
 
+    const diagnostics = await collectArtifactDiagnostics(db);
     const { rowsInArtifact, rowsAttempted } = await countArtifactRows(db);
     const { rowsLoaded, dbRowsInserted, dbRowsUpdated } =
       await bulkUpsertFromTemp(
@@ -386,10 +538,14 @@ async function main() {
       dbRowsUpdated,
     );
 
+    await db.query("COMMIT");
+
     const loadReport = {
+      artifact_contract_version: manifest.artifact_contract_version,
       ingestion_source: manifest.ingestion_source,
       run_id: manifest.run_id,
       artifacts_dir: runDir,
+      csv_header: expectedHeader,
       load_started_at: loadStartedAtIso,
       rows_in_artifact: rowsInArtifact,
       rows_attempted: rowsAttempted,
@@ -397,6 +553,10 @@ async function main() {
       db_rows_inserted: dbRowsInserted,
       db_rows_updated: dbRowsUpdated,
       db_rows_unchanged: dbRowsUnchanged,
+      min_date_time_published: diagnostics.minDateTimePublished,
+      max_date_time_published: diagnostics.maxDateTimePublished,
+      sample_uris: diagnostics.sampleUris,
+      populated_counts: diagnostics.populatedCounts,
       load_completed_at: loadCompletedAtIso,
       duration_ms: Date.now() - startedMs,
       pipeline_status: "loaded",
@@ -410,6 +570,12 @@ async function main() {
     console.log("Load complete:", loadReportPath);
   } catch (e: any) {
     console.error(e);
+
+    try {
+      await db.query("ROLLBACK");
+    } catch {
+      // ignore rollback failure
+    }
 
     try {
       await markRunFailed(

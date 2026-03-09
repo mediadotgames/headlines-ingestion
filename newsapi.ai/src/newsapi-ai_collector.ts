@@ -1,9 +1,9 @@
 import "dotenv/config";
-import fs from "node:fs";
-import path from "node:path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Client } from "pg";
 import { DateTime } from "luxon";
-import { csvHeader, toCsvRow } from "./shared/newsapi-aiArtifactSchema";
+import { csvHeader, toCsvRow, ARTIFACT_CONTRACT_VERSION } from "./shared/newsapi-aiArtifactSchema";
 console.log("collector starting...");
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
@@ -30,6 +30,13 @@ if (sourceUris.length === 0) {
 
 type Source = Record<string, unknown> | null;
 type Author = Record<string, unknown>;
+type Category = Record<string, unknown>;
+type Concept = Record<string, unknown>;
+type Video = Record<string, unknown>;
+type Shares = Record<string, unknown> | number | null;
+type Location = Record<string, unknown> | null;
+type OriginalArticle = Record<string, unknown> | null;
+type ExtractedDate = Record<string, unknown>;
 
 type NewsApiAiArticle = {
   uri?: string | number | null;
@@ -50,6 +57,18 @@ type NewsApiAiArticle = {
   image?: string | null;
   source?: Source;
   authors?: Author[] | null;
+
+  categories?: Category[] | null;
+  concepts?: Concept[] | null;
+  links?: string[] | null;
+  videos?: Video[] | null;
+  shares?: Shares;
+  socialScore?: Shares;
+  duplicateList?: string[] | null;
+  extractedDates?: ExtractedDate[] | null;
+  location?: Location;
+  originalArticle?: OriginalArticle;
+
   sim?: number | null;
   wgt?: number | null;
 };
@@ -136,13 +155,35 @@ async function fetchPage(args: {
 
   const body = {
     apiKey: EVENTREGISTRY_API_KEY,
+    resultType: "articles",
     lang: "eng",
     sourceUri: sourceUris,
     dateStart: args.dateStart,
     dateEnd: args.dateEnd,
     articlesPage: args.page,
+    articlesCount: PAGE_SIZE,
     articlesSortBy: "date",
     articlesSortByAsc: false,
+    includeArticleSocialScore: true,
+    includeArticleConcepts: true,
+    includeArticleCategories: true,
+    includeArticleLocation: true,
+    includeArticleVideos: true,
+    includeArticleLinks: true,
+    includeArticleExtractedDates: true,
+    includeArticleDuplicateList: true,
+    includeArticleOriginalArticle: true,
+    includeSourceDescription: true,
+    includeSourceLocation: true,
+    includeSourceRanking: true,
+    includeConceptImage: true,
+    includeConceptSynonyms: true,
+    includeCategoryParentUri: true,
+    includeLocationGeoLocation: true,
+    includeLocationPopulation: true,
+    includeLocationGeoNamesId: true,
+    includeLocationCountryArea: true,
+    includeLocationCountryContinent: true,
   };
 
   const res = await fetch(url, {
@@ -419,6 +460,16 @@ async function main() {
             authors: a.authors ?? [],
             sim: a.sim ?? null,
             wgt: a.wgt ?? null,
+            categories: a.categories ?? null,
+            concepts: a.concepts ?? null,
+            links: a.links ?? null,
+            videos: a.videos ?? null,
+            shares: a.shares ?? a.socialScore ?? null,
+            duplicate_list: a.duplicateList ?? null,
+            extracted_dates: a.extractedDates ?? null,
+            location: a.location ?? null,
+            original_article: a.originalArticle ?? null,
+            raw_article: a,
           }),
         )
         .join("\n") + "\n";
@@ -442,10 +493,20 @@ async function main() {
         relevance: a.relevance == null ? "" : String(a.relevance),
         story_uri: a.storyUri ?? "",
         image: a.image ?? "",
-        source: JSON.stringify(a.source ?? null),
-        authors: JSON.stringify(a.authors ?? []),
+        source: jsonString(a.source),
+        authors: jsonString(a.authors ?? []),
         sim: a.sim == null ? "" : String(a.sim),
         wgt: a.wgt == null ? "" : String(a.wgt),
+        categories: jsonString(a.categories),
+        concepts: jsonString(a.concepts),
+        links: jsonString(a.links),
+        videos: jsonString(a.videos),
+        shares: jsonString(a.shares ?? a.socialScore),
+        duplicate_list: jsonString(a.duplicateList),
+        extracted_dates: jsonString(a.extractedDates),
+        location: jsonString(a.location),
+        original_article: jsonString(a.originalArticle),
+        raw_article: jsonString(a),
       }),
     );
 
@@ -456,6 +517,7 @@ async function main() {
     );
 
     const manifest = {
+      artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
       ingestion_source: INGESTION_SOURCE,
       canonical_tz: CANON_TZ,
       run_id,

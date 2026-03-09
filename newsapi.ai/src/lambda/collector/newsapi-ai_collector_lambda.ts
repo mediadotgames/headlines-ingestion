@@ -1,16 +1,10 @@
 import "dotenv/config";
-import fs from "node:fs";
-import path from "node:path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Client } from "pg";
 import { DateTime } from "luxon";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { csvHeader, toCsvRow } from "../../shared/newsapi-aiArtifactSchema";
-
-/**
- * Canonical "USA day" policy:
- * - We use Hawaii (Pacific/Honolulu) as the canonical timezone boundary.
- * - Each run collects the last 48 hours ending at Honolulu midnight.
- */
 
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
@@ -21,11 +15,11 @@ const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS ?? 2);
 const WINDOW_END_DAYS_AGO = Number(process.env.WINDOW_END_DAYS_AGO ?? 0);
 const SEED_RUN = process.env.SEED_RUN === "true";
 const SEED_RUN_ID = "1900-01-01T00:00:00.000Z";
+const ARTIFACT_CONTRACT_VERSION = "newsapi-ai/v2";
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
-if (!EVENTREGISTRY_SOURCE_URIS) {
+if (!EVENTREGISTRY_SOURCE_URIS)
   throw new Error("Missing EVENTREGISTRY_SOURCE_URIS");
-}
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 if (!ARTIFACT_BUCKET) throw new Error("Missing ARTIFACT_BUCKET");
 if (!ARTIFACT_PREFIX) throw new Error("Missing ARTIFACT_PREFIX");
@@ -38,15 +32,20 @@ const MAX_PAGES = 500;
 const sourceUris = EVENTREGISTRY_SOURCE_URIS.split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-
-if (sourceUris.length === 0) {
+if (sourceUris.length === 0)
   throw new Error("EVENTREGISTRY_SOURCE_URIS resolved to an empty list");
-}
 
 const s3 = new S3Client({});
 
 type Source = Record<string, unknown> | null;
 type Author = Record<string, unknown>;
+type Category = Record<string, unknown>;
+type Concept = Record<string, unknown>;
+type Video = Record<string, unknown>;
+type Shares = Record<string, unknown> | number | null;
+type Location = Record<string, unknown> | null;
+type OriginalArticle = Record<string, unknown> | null;
+type ExtractedDate = Record<string, unknown>;
 
 type NewsApiAiArticle = {
   uri?: string | number | null;
@@ -67,17 +66,23 @@ type NewsApiAiArticle = {
   image?: string | null;
   source?: Source;
   authors?: Author[] | null;
+  categories?: Category[] | null;
+  concepts?: Concept[] | null;
+  links?: string[] | null;
+  videos?: Video[] | null;
+  shares?: Shares;
+  socialScore?: Shares;
+  duplicateList?: string[] | null;
+  extractedDates?: ExtractedDate[] | null;
+  location?: Location;
+  originalArticle?: OriginalArticle;
   sim?: number | null;
   wgt?: number | null;
 };
 
 type EventRegistryResponse = {
   articles?:
-    | {
-        results?: NewsApiAiArticle[];
-        pages?: number;
-        totalResults?: number;
-      }
+    | { results?: NewsApiAiArticle[]; pages?: number; totalResults?: number }
     | NewsApiAiArticle[];
   results?: NewsApiAiArticle[];
   error?: unknown;
@@ -85,32 +90,19 @@ type EventRegistryResponse = {
 
 function isoOrThrow(dt: DateTime, label: string): string {
   const s = dt.toISO();
-  if (!s) {
-    throw new Error(
-      `Luxon produced null ISO for ${label}. isValid=${dt.isValid} reason=${dt.invalidReason ?? ""}`,
-    );
-  }
+  if (!s) throw new Error(`Luxon produced null ISO for ${label}`);
   return s;
 }
 
-function computeHonoluluWindowUtc(): {
-  runIdUtc: DateTime;
-  windowFromUtc: DateTime;
-  windowToUtc: DateTime;
-  windowFromLocal: DateTime;
-  windowToLocal: DateTime;
-} {
+function computeHonoluluWindowUtc() {
   const windowToLocal = DateTime.now()
     .setZone(CANON_TZ)
     .startOf("day")
     .minus({ days: WINDOW_END_DAYS_AGO });
-
   const windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
-
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
-
   return {
     runIdUtc,
     windowFromUtc,
@@ -118,6 +110,10 @@ function computeHonoluluWindowUtc(): {
     windowFromLocal,
     windowToLocal,
   };
+}
+
+function jsonString(value: unknown): string {
+  return JSON.stringify(value ?? null);
 }
 
 function parseArticleDateMs(article: NewsApiAiArticle): number | null {
@@ -150,16 +146,37 @@ async function fetchPage(args: {
   dateEnd: string;
 }): Promise<{ articles: NewsApiAiArticle[]; raw: EventRegistryResponse }> {
   const url = "https://eventregistry.org/api/v1/article/getArticles";
-
   const body = {
     apiKey: EVENTREGISTRY_API_KEY,
+    resultType: "articles",
     lang: "eng",
     sourceUri: sourceUris,
     dateStart: args.dateStart,
     dateEnd: args.dateEnd,
     articlesPage: args.page,
+    articlesCount: PAGE_SIZE,
     articlesSortBy: "date",
     articlesSortByAsc: false,
+    includeArticleSocialScore: true,
+    includeArticleConcepts: true,
+    includeArticleCategories: true,
+    includeArticleLocation: true,
+    includeArticleVideos: true,
+    includeArticleLinks: true,
+    includeArticleExtractedDates: true,
+    includeArticleDuplicateList: true,
+    includeArticleOriginalArticle: true,
+    includeSourceDescription: true,
+    includeSourceLocation: true,
+    includeSourceRanking: true,
+    includeConceptImage: true,
+    includeConceptSynonyms: true,
+    includeCategoryParentUri: true,
+    includeLocationGeoLocation: true,
+    includeLocationPopulation: true,
+    includeLocationGeoNamesId: true,
+    includeLocationCountryArea: true,
+    includeLocationCountryContinent: true,
   };
 
   const res = await fetch(url, {
@@ -169,18 +186,12 @@ async function fetchPage(args: {
   });
 
   const json = (await res.json().catch(() => ({}))) as EventRegistryResponse;
-
-  if (!res.ok) {
+  if (!res.ok)
     throw new Error(
       `Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`,
     );
-  }
-
   const errMsg = firstErrorMessage(json);
-  if (errMsg) {
-    throw new Error(`Event Registry error: ${errMsg}`);
-  }
-
+  if (errMsg) throw new Error(`Event Registry error: ${errMsg}`);
   return { articles: extractArticles(json), raw: json };
 }
 
@@ -193,11 +204,9 @@ async function upsertPipelineRunStarted(
     windowTo: Date;
   },
 ) {
-  const sql = `
-    INSERT INTO public.pipeline_runs (
-      run_id, ingestion_source, window_from, window_to,
-      status, created_at, updated_at
-    )
+  await db.query(
+    `
+    INSERT INTO public.pipeline_runs (run_id, ingestion_source, window_from, window_to, status, created_at, updated_at)
     VALUES ($1, $2, $3, $4, 'started', now(), now())
     ON CONFLICT (run_id, ingestion_source) DO UPDATE SET
       window_from = EXCLUDED.window_from,
@@ -206,14 +215,9 @@ async function upsertPipelineRunStarted(
       error_code = NULL,
       error_message = NULL,
       updated_at = now()
-  `;
-
-  await db.query(sql, [
-    args.runId,
-    args.ingestionSource,
-    args.windowFrom,
-    args.windowTo,
-  ]);
+  `,
+    [args.runId, args.ingestionSource, args.windowFrom, args.windowTo],
+  );
 }
 
 async function updatePipelineRunCollected(
@@ -226,26 +230,20 @@ async function updatePipelineRunCollected(
     articlesDeduped: number;
   },
 ) {
-  const sql = `
+  await db.query(
+    `
     UPDATE public.pipeline_runs
-    SET
-      collected_at = $3,
-      articles_fetched = $4,
-      articles_deduped = $5,
-      status = 'collected',
-      error_code = NULL,
-      error_message = NULL,
-      updated_at = now()
+    SET collected_at = $3, articles_fetched = $4, articles_deduped = $5, status = 'collected', error_code = NULL, error_message = NULL, updated_at = now()
     WHERE run_id = $1 AND ingestion_source = $2
-  `;
-
-  await db.query(sql, [
-    args.runId,
-    args.ingestionSource,
-    args.collectedAt,
-    args.articlesFetched,
-    args.articlesDeduped,
-  ]);
+  `,
+    [
+      args.runId,
+      args.ingestionSource,
+      args.collectedAt,
+      args.articlesFetched,
+      args.articlesDeduped,
+    ],
+  );
 }
 
 async function markPipelineRunFailed(
@@ -257,22 +255,19 @@ async function markPipelineRunFailed(
     errorMessage: string;
   },
 ) {
-  const sql = `
+  await db.query(
+    `
     UPDATE public.pipeline_runs
-    SET
-      status = 'failed',
-      error_code = $3,
-      error_message = $4,
-      updated_at = now()
+    SET status = 'failed', error_code = $3, error_message = $4, updated_at = now()
     WHERE run_id = $1 AND ingestion_source = $2
-  `;
-
-  await db.query(sql, [
-    args.runId,
-    args.ingestionSource,
-    args.errorCode ?? null,
-    args.errorMessage,
-  ]);
+  `,
+    [
+      args.runId,
+      args.ingestionSource,
+      args.errorCode ?? null,
+      args.errorMessage,
+    ],
+  );
 }
 
 async function uploadFile(
@@ -293,11 +288,16 @@ async function uploadFile(
 }
 
 export const handler = async () => {
-  console.log("collector starting...");
-  console.log("NEWSAPI-AI COLLECTOR BUILD MARKER v2");
-  console.log("SEED_RUN:", SEED_RUN);
-  console.log("LOOKBACK_DAYS:", LOOKBACK_DAYS);
-  console.log("WINDOW_END_DAYS_AGO:", WINDOW_END_DAYS_AGO);
+  console.log("collector starting");
+  console.log("artifact_contract_version:", ARTIFACT_CONTRACT_VERSION);
+  console.log("ingestion_source:", INGESTION_SOURCE);
+  console.log("seed_run:", SEED_RUN);
+  console.log("lookback_days:", LOOKBACK_DAYS);
+  console.log("window_end_days_ago:", WINDOW_END_DAYS_AGO);
+  console.log("page_size:", PAGE_SIZE);
+  console.log("max_pages:", MAX_PAGES);
+  console.log("source_uris_count:", sourceUris.length);
+  console.log("source_uris:", sourceUris);
 
   const {
     runIdUtc,
@@ -306,13 +306,11 @@ export const handler = async () => {
     windowFromLocal,
     windowToLocal,
   } = computeHonoluluWindowUtc();
-
   const run_id = SEED_RUN ? SEED_RUN_ID : isoOrThrow(runIdUtc, "run_id");
   const window_from = isoOrThrow(windowFromUtc, "window_from");
   const window_to = isoOrThrow(windowToUtc, "window_to");
   const window_from_local = isoOrThrow(windowFromLocal, "window_from_local");
   const window_to_local = isoOrThrow(windowToLocal, "window_to_local");
-
   const date_start = windowFromUtc.toISODate();
   const date_end = windowToUtc.toISODate();
 
@@ -320,24 +318,19 @@ export const handler = async () => {
     throw new Error("Failed to compute dateStart/dateEnd in YYYY-MM-DD format");
   }
 
-  console.log("ingestion_source:", INGESTION_SOURCE);
-  console.log("canonical_tz:", CANON_TZ);
-  console.log("run_id (UTC instant of Honolulu midnight):", run_id);
-  console.log("window (UTC):", window_from, "->", window_to);
-  console.log(
-    "window (Honolulu local):",
-    window_from_local,
-    "->",
-    window_to_local,
-  );
-  console.log("source_uris:", sourceUris);
+  console.log("run_id:", run_id);
+  console.log("window_utc:", { window_from, window_to });
+  console.log("window_local:", { window_from_local, window_to_local });
+  console.log("date_range:", { date_start, date_end });
 
   const useSSL = !DATABASE_URL.includes("localhost");
   const db = new Client({
     connectionString: DATABASE_URL,
     ssl: useSSL ? { rejectUnauthorized: false } : false,
+    connectionTimeoutMillis: 5000,
   });
   await db.connect();
+  console.log("database_connected");
 
   const safeRunId = run_id.replace(/:/g, "-");
   const tmpDir = path.join(
@@ -351,11 +344,10 @@ export const handler = async () => {
   const jsonlPath = path.join(tmpDir, "articles.jsonl");
   const csvPath = path.join(tmpDir, "articles.csv");
   const manifestPath = path.join(tmpDir, "manifest.json");
+  const s3RunPrefix = `${ARTIFACT_PREFIX.replace(/\/$/, "")}/ingestion_source=${INGESTION_SOURCE}/run_id=${safeRunId}`;
 
-  const s3RunPrefix =
-    `${ARTIFACT_PREFIX.replace(/\/$/, "")}` +
-    `/ingestion_source=${INGESTION_SOURCE}` +
-    `/run_id=${safeRunId}`;
+  console.log("tmp_dir:", tmpDir);
+  console.log("s3_run_prefix:", `s3://${ARTIFACT_BUCKET}/${s3RunPrefix}/`);
 
   try {
     await upsertPipelineRunStarted(db, {
@@ -364,6 +356,7 @@ export const handler = async () => {
       windowFrom: windowFromUtc.toJSDate(),
       windowTo: windowToUtc.toJSDate(),
     });
+    console.log("pipeline_run_marked_started");
 
     const hardFromMs = windowFromUtc.toMillis();
     const hardToMs = windowToUtc.toMillis();
@@ -376,9 +369,12 @@ export const handler = async () => {
         dateStart: date_start,
         dateEnd: date_end,
       });
-
       console.log(`page ${page}: batch=${articles.length}`);
-      if (articles.length === 0) break;
+
+      if (articles.length === 0) {
+        console.log(`page ${page}: empty batch, stopping`);
+        break;
+      }
 
       totalFetched += articles.length;
       let oldestMsOnPage: number | null = null;
@@ -400,30 +396,35 @@ export const handler = async () => {
         byUri.set(uri, article);
       }
 
-      if (articles.length < PAGE_SIZE) break;
+      if (articles.length < PAGE_SIZE) {
+        console.log(`page ${page}: batch smaller than page_size, stopping`);
+        break;
+      }
+
       if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
         console.log(
-          "Stopping early because oldest article on a page crossed window_from",
+          `page ${page}: stopping early because oldest article crossed window_from`,
         );
         break;
       }
     }
 
-    if (byUri.size === 0) {
+    if (byUri.size === 0)
       throw new Error(
         "Collector fetched zero articles — aborting artifact write",
       );
-    }
 
-    const deduped = Array.from(byUri.values());
-    deduped.sort(
+    const deduped = Array.from(byUri.values()).sort(
       (a, b) => (parseArticleDateMs(b) ?? 0) - (parseArticleDateMs(a) ?? 0),
     );
-
     const collectedAt = new Date();
     const collected_at = collectedAt.toISOString();
 
-    console.log(`fetched=${totalFetched} deduped_by_uri=${deduped.length}`);
+    console.log("fetch_summary:", {
+      total_fetched: totalFetched,
+      deduped_by_uri: deduped.length,
+      collected_at,
+    });
 
     await updatePipelineRunCollected(db, {
       runId: runIdUtc.toJSDate(),
@@ -432,6 +433,7 @@ export const handler = async () => {
       articlesFetched: totalFetched,
       articlesDeduped: deduped.length,
     });
+    console.log("pipeline_run_marked_collected");
 
     const jsonl =
       deduped
@@ -462,6 +464,16 @@ export const handler = async () => {
             authors: a.authors ?? [],
             sim: a.sim ?? null,
             wgt: a.wgt ?? null,
+            categories: a.categories ?? null,
+            concepts: a.concepts ?? null,
+            links: a.links ?? null,
+            videos: a.videos ?? null,
+            shares: a.shares ?? a.socialScore ?? null,
+            duplicate_list: a.duplicateList ?? null,
+            extracted_dates: a.extractedDates ?? null,
+            location: a.location ?? null,
+            original_article: a.originalArticle ?? null,
+            raw_article: a,
           }),
         )
         .join("\n") + "\n";
@@ -485,10 +497,20 @@ export const handler = async () => {
         relevance: a.relevance == null ? "" : String(a.relevance),
         story_uri: a.storyUri ?? "",
         image: a.image ?? "",
-        source: JSON.stringify(a.source ?? null),
+        source: jsonString(a.source),
         authors: JSON.stringify(a.authors ?? []),
         sim: a.sim == null ? "" : String(a.sim),
         wgt: a.wgt == null ? "" : String(a.wgt),
+        categories: jsonString(a.categories),
+        concepts: jsonString(a.concepts),
+        links: jsonString(a.links),
+        videos: jsonString(a.videos),
+        shares: jsonString(a.shares ?? a.socialScore),
+        duplicate_list: jsonString(a.duplicateList),
+        extracted_dates: jsonString(a.extractedDates),
+        location: jsonString(a.location),
+        original_article: jsonString(a.originalArticle),
+        raw_article: jsonString(a),
       }),
     );
 
@@ -499,6 +521,7 @@ export const handler = async () => {
     );
 
     const manifest = {
+      artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
       ingestion_source: INGESTION_SOURCE,
       canonical_tz: CANON_TZ,
       run_id,
@@ -529,29 +552,44 @@ export const handler = async () => {
       "utf8",
     );
 
+    console.log("artifact_files_written:", {
+      jsonlPath,
+      csvPath,
+      manifestPath,
+    });
+
     await uploadFile(
       ARTIFACT_BUCKET,
       `${s3RunPrefix}/articles.jsonl`,
       jsonlPath,
       "application/x-ndjson",
     );
+    console.log("uploaded:", `${s3RunPrefix}/articles.jsonl`);
+
     await uploadFile(
       ARTIFACT_BUCKET,
       `${s3RunPrefix}/articles.csv`,
       csvPath,
       "text/csv",
     );
+    console.log("uploaded:", `${s3RunPrefix}/articles.csv`);
+
     await uploadFile(
       ARTIFACT_BUCKET,
       `${s3RunPrefix}/manifest.json`,
       manifestPath,
       "application/json",
     );
+    console.log("uploaded:", `${s3RunPrefix}/manifest.json`);
 
-    console.log("uploaded to:", `s3://${ARTIFACT_BUCKET}/${s3RunPrefix}/`);
+    console.log("collector_completed_successfully");
   } catch (e: any) {
     const msg = e?.message ? String(e.message) : String(e);
-    console.error(e);
+    console.error("collector_failed:", {
+      message: msg,
+      run_id,
+      ingestion_source: INGESTION_SOURCE,
+    });
 
     try {
       await markPipelineRunFailed(db, {
@@ -560,12 +598,14 @@ export const handler = async () => {
         errorCode: "collector_error",
         errorMessage: msg.slice(0, 2000),
       });
+      console.log("pipeline_run_marked_failed");
     } catch (inner) {
-      console.error("Also failed to mark pipeline_runs as failed:", inner);
+      console.error("failed_to_mark_pipeline_run_failed:", inner);
     }
 
     throw e;
   } finally {
     await db.end().catch(() => {});
+    console.log("database_connection_closed");
   }
 };
