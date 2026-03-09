@@ -19,7 +19,18 @@ export type NewsApiAiArtifactRow = {
   authors: string;
   sim: string;
   wgt: string;
+  categories: string | null;
+  concepts: string | null;
+  links: string | null;
+  videos: string | null;
+  shares: string | null;
+  duplicate_list: string | null;
+  extracted_dates: string | null;
+  location: string | null;
+  original_article: string | null;
+  raw_article: string | null;
 };
+export const ARTIFACT_CONTRACT_VERSION = "newsapi-ai/v2";
 
 const HEADERS: Array<keyof NewsApiAiArtifactRow> = [
   "uri",
@@ -42,6 +53,16 @@ const HEADERS: Array<keyof NewsApiAiArtifactRow> = [
   "authors",
   "sim",
   "wgt",
+  "categories",
+  "concepts",
+  "links",
+  "videos",
+  "shares",
+  "duplicate_list",
+  "extracted_dates",
+  "location",
+  "original_article",
+  "raw_article",
 ];
 
 export function csvHeader(): string {
