@@ -10,7 +10,7 @@ import {
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
 import type { S3Event } from "aws-lambda";
-import { csvHeader } from "../../shared/newsapi-aiArtifactSchema";
+import { csvHeader } from "../shared/newsapi-aiArtifactSchema";
 
 const DATABASE_URL = process.env.DATABASE_URL!;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
