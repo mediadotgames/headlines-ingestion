@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { Client } from "pg";
 import { DateTime } from "luxon";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { csvHeader, toCsvRow } from "../../shared/newsapi-aiArtifactSchema";
+import { csvHeader, toCsvRow } from "../shared/newsapi-aiArtifactSchema";
 
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
