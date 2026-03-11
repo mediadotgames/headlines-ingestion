@@ -37,6 +37,7 @@ const CANON_TZ = "Pacific/Honolulu";
 const PAGE_SIZE = 100;
 const MAX_PAGES = 500;
 const FETCH_MAX_ATTEMPTS = 5;
+const MAX_CONSECUTIVE_REPEATED_PAGES = 3;
 
 const sourceUris = EVENTREGISTRY_SOURCE_URIS.split(",")
   .map((s) => s.trim())
@@ -478,6 +479,9 @@ async function main() {
     let totalFetched = 0;
     let consecutiveEarlyStopQualifiedPages = 0;
 
+    const seenPageFingerprints = new Set<string>();
+    let consecutiveRepeatedPages = 0;
+
     for (let page = 1; page <= MAX_PAGES; page++) {
       const { articles } = await fetchPage({
         page,
@@ -494,6 +498,25 @@ async function main() {
         .map((a) => (a.uri == null ? "" : String(a.uri).trim()))
         .filter(Boolean);
       const uniquePageUris = new Set(pageUris);
+
+      const pageFingerprint = pageUris.slice(0, 10).join("|");
+      const pageAlreadySeen = seenPageFingerprints.has(pageFingerprint);
+
+      if (pageAlreadySeen) {
+        consecutiveRepeatedPages += 1;
+        console.warn(
+          `page ${page}: repeated page fingerprint detected (count=${consecutiveRepeatedPages})`,
+        );
+      } else {
+        seenPageFingerprints.add(pageFingerprint);
+        consecutiveRepeatedPages = 0;
+      }
+
+      if (consecutiveRepeatedPages >= MAX_CONSECUTIVE_REPEATED_PAGES) {
+        throw new Error(
+          `Collector detected repeated pagination for ${consecutiveRepeatedPages} consecutive pages; aborting to avoid incomplete artifact`,
+        );
+      }
 
       let oldestMsOnPage: number | null = null;
       const sizeBefore = byUri.size;
@@ -528,9 +551,9 @@ async function main() {
       if (articles.length < PAGE_SIZE) break;
 
       if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
-        if (newUniqueUrisAdded === 0) {
+        if (pageAlreadySeen || newUniqueUrisAdded === 0) {
           console.warn(
-            `page ${page}: oldest article crossed window_from, but page added 0 new URIs; possible repeated page, ignoring early-stop`,
+            `page ${page}: oldest article crossed window_from, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
           );
           consecutiveEarlyStopQualifiedPages = 0;
         } else {
@@ -541,7 +564,7 @@ async function main() {
 
           if (consecutiveEarlyStopQualifiedPages >= 2) {
             console.log(
-              `page ${page}: stopping early after ${consecutiveEarlyStopQualifiedPages} consecutive early-stop-qualified pages`,
+              `page ${page}: stopping early after ${consecutiveEarlyStopQualifiedPages} consecutive trustworthy early-stop-qualified pages`,
             );
             break;
           }
@@ -693,7 +716,7 @@ async function main() {
       page_size: PAGE_SIZE,
       max_pages: MAX_PAGES,
       pagination_optimization:
-        "stop after 2 consecutive early-stop-qualified pages that still add new URIs",
+        "stop after 2 consecutive trustworthy early-stop-qualified pages; abort after 3 repeated page fingerprints",
       schedule_recommendation: {
         service: "EventBridge Scheduler",
         timezone: CANON_TZ,
