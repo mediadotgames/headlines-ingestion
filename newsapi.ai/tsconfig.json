@@ -6,5 +6,9 @@
     "outDir": "./dist",
     "strict": true,
     "esModuleInterop": true
-  }
+  },  "exclude": [
+    "node_modules",
+    "dist",
+    "src/articles/lambda"
+  ]
 }
