@@ -5,9 +5,13 @@
   "main": "index.js",
   "scripts": {
     "build": "npx tsc",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "build:lambda:collector:newsapi-ai": "esbuild src/lambda/collector/newsapi-ai_collector_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambda/newsapi-ai-collector.js",
-    "build:lambda:loader:newsapi-ai": "esbuild src/lambda/loader/newsapi-ai_loader_lambda.ts --bundle --platform=node --target=node20 --outfile=dist/lambda/newsapi-ai-loader.js"
+    "build:lambda:collector:newsapi-ai": "esbuild src/articles/lambda/newsapi-ai_collector_lambda.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/articles/lambda/newsapi-ai-collector.js",
+    "build:lambda:loader:newsapi-ai": "esbuild src/articles/lambda/newsapi-ai_loader_lambda.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/articles/lambda/newsapi-ai-loader.js",
+    "zip:lambda:collector:newsapi-ai": "node scripts/zip-lambda.js dist/articles/lambda/newsapi-ai-collector.js dist/articles/lambda/newsapi-ai-collector.zip",
+    "zip:lambda:loader:newsapi-ai": "node scripts/zip-lambda.js dist/articles/lambda/newsapi-ai-loader.js dist/articles/lambda/newsapi-ai-loader.zip",
+    "package:lambda:collector:newsapi-ai": "npm run build:lambda:collector:newsapi-ai && npm run zip:lambda:collector:newsapi-ai",
+    "package:lambda:loader:newsapi-ai": "npm run build:lambda:loader:newsapi-ai && npm run zip:lambda:loader:newsapi-ai",
+    "package:lambdas": "npm run package:lambda:collector:newsapi-ai && npm run package:lambda:loader:newsapi-ai"
   },
   "keywords": [],
   "author": "",
@@ -26,6 +30,7 @@
     "@types/node": "^25.3.4",
     "@types/pg": "^8.18.0",
     "@types/pg-copy-streams": "^1.2.5",
+    "archiver": "^7.0.1",
     "esbuild": "^0.27.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"

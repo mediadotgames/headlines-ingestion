@@ -1,5 +1,7 @@
 export type NewsApiAiArtifactRow = {
   uri: string;
+  run_type: string;
+  nth_run: string;
   url: string;
   title: string;
   body: string;
@@ -30,10 +32,13 @@ export type NewsApiAiArtifactRow = {
   original_article: string | null;
   raw_article: string | null;
 };
-export const ARTIFACT_CONTRACT_VERSION = "newsapi-ai/v2";
+
+export const ARTIFACT_CONTRACT_VERSION = "newsapi-ai/v3";
 
 const HEADERS: Array<keyof NewsApiAiArtifactRow> = [
   "uri",
+  "run_type",
+  "nth_run",
   "url",
   "title",
   "body",
