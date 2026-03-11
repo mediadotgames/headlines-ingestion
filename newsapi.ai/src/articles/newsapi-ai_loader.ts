@@ -16,6 +16,8 @@ type Manifest = {
   artifact_contract_version: string;
   ingestion_source: string;
   run_id: string;
+  run_type: string;
+  nth_run: number;
   collected_at: string;
   window_from?: string;
   window_to?: string;
@@ -46,21 +48,56 @@ function truncateErrorMessage(msg: string, max = 2000): string {
   return msg.length <= max ? msg : msg.slice(0, max);
 }
 
+function listManifestPaths(baseDir: string): string[] {
+  const found: string[] = [];
+
+  function walk(dir: string) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && entry.name === "manifest.json") {
+        found.push(full);
+      }
+    }
+  }
+
+  walk(baseDir);
+  return found;
+}
+
+function pickLatestManifestPath(baseOutDir: string): string {
+  const root = path.join(baseOutDir, "out", "ingestion_source=newsapi-ai");
+  const manifests = listManifestPaths(root);
+
+  if (manifests.length === 0) {
+    throw new Error(`No manifest.json files found under ${root}`);
+  }
+
+  manifests.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return manifests[0];
+}
+
 async function setLoadStarted(
   db: Client,
   runId: string,
   ingestionSource: string,
+  runType: string,
+  nthRun: number,
   whenIso: string,
 ) {
   await db.query(
     `
     UPDATE public.pipeline_runs
     SET
-      load_started_at = COALESCE(load_started_at, $3),
+      load_started_at = COALESCE(load_started_at, $5),
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
     `,
-    [runId, ingestionSource, whenIso],
+    [runId, ingestionSource, runType, nthRun, whenIso],
   );
 }
 
@@ -68,6 +105,8 @@ async function setLoadCompleted(
   db: Client,
   runId: string,
   ingestionSource: string,
+  runType: string,
+  nthRun: number,
   whenIso: string,
   rowsLoaded: number,
   dbRowsInserted: number,
@@ -77,19 +116,24 @@ async function setLoadCompleted(
     `
     UPDATE public.pipeline_runs
     SET
-      load_completed_at = $3,
-      rows_loaded = $4,
-      db_rows_inserted = $5,
-      db_rows_updated = $6,
+      load_completed_at = $5,
+      rows_loaded = $6,
+      db_rows_inserted = $7,
+      db_rows_updated = $8,
       status = 'loaded',
       error_code = NULL,
       error_message = NULL,
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
     `,
     [
       runId,
       ingestionSource,
+      runType,
+      nthRun,
       whenIso,
       rowsLoaded,
       dbRowsInserted,
@@ -102,6 +146,8 @@ async function markRunFailed(
   db: Client,
   runId: string,
   ingestionSource: string,
+  runType: string,
+  nthRun: number,
   code: string,
   message: string,
 ) {
@@ -110,34 +156,24 @@ async function markRunFailed(
     UPDATE public.pipeline_runs
     SET
       status = 'failed',
-      error_code = $3,
-      error_message = $4,
+      error_code = $5,
+      error_message = $6,
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
     `,
-    [runId, ingestionSource, code, truncateErrorMessage(message)],
+    [runId, ingestionSource, runType, nthRun, code, truncateErrorMessage(message)],
   );
-}
-
-function pickLatestRunDir(baseOutDir: string): string {
-  const runsRoot = path.join(baseOutDir, "ingestion_source=newsapi-ai");
-  const names = fs
-    .readdirSync(runsRoot, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && d.name.startsWith("run_id="))
-    .map((d) => d.name)
-    .sort();
-
-  if (names.length === 0) {
-    throw new Error(`No run directories found under ${runsRoot}`);
-  }
-
-  return path.join(runsRoot, names[names.length - 1]);
 }
 
 async function copyCsvIntoTempTable(db: Client, csvPath: string) {
   await db.query(`
     CREATE TEMP TABLE tmp_newsapi_ai_load (
       uri                 text,
+      run_type            text,
+      nth_run             text,
       url                 text,
       title               text,
       body                text,
@@ -173,6 +209,8 @@ async function copyCsvIntoTempTable(db: Client, csvPath: string) {
   const copySql = `
     COPY tmp_newsapi_ai_load (
       uri,
+      run_type,
+      nth_run,
       url,
       title,
       body,
@@ -259,6 +297,7 @@ async function collectArtifactDiagnostics(db: Client): Promise<ArtifactDiagnosti
   `);
 
   const row = statsRes.rows[0];
+
   return {
     rowsInArtifact: Number(row.rows_in_artifact),
     minDateTimePublished: row.min_date_time_published
@@ -289,6 +328,8 @@ async function bulkUpsertFromTemp(
   db: Client,
   ingestionSource: string,
   runId: string,
+  runType: string,
+  nthRun: number,
   collectedAt: string,
 ) {
   const res = await db.query(
@@ -327,6 +368,8 @@ async function bulkUpsertFromTemp(
         raw_article,
         ingestion_source,
         run_id,
+        run_type,
+        nth_run,
         collected_at,
         ingested_at
       )
@@ -367,7 +410,9 @@ async function bulkUpsertFromTemp(
         NULLIF(raw_article, '')::jsonb AS raw_article,
         $1 AS ingestion_source,
         $2::timestamptz AS run_id,
-        $3::timestamptz AS collected_at,
+        COALESCE(NULLIF(run_type, ''), $3) AS run_type,
+        COALESCE(NULLIF(nth_run, '')::integer, $4::integer) AS nth_run,
+        $5::timestamptz AS collected_at,
         now() AS ingested_at
       FROM tmp_newsapi_ai_load
       WHERE NULLIF(uri, '') IS NOT NULL
@@ -403,6 +448,8 @@ async function bulkUpsertFromTemp(
         raw_article = EXCLUDED.raw_article,
         ingestion_source = EXCLUDED.ingestion_source,
         run_id = EXCLUDED.run_id,
+        run_type = EXCLUDED.run_type,
+        nth_run = EXCLUDED.nth_run,
         collected_at = EXCLUDED.collected_at,
         updated_at = now()
       WHERE
@@ -437,6 +484,8 @@ async function bulkUpsertFromTemp(
         public.newsapi_articles.raw_article IS DISTINCT FROM EXCLUDED.raw_article OR
         public.newsapi_articles.ingestion_source IS DISTINCT FROM EXCLUDED.ingestion_source OR
         public.newsapi_articles.run_id IS DISTINCT FROM EXCLUDED.run_id OR
+        public.newsapi_articles.run_type IS DISTINCT FROM EXCLUDED.run_type OR
+        public.newsapi_articles.nth_run IS DISTINCT FROM EXCLUDED.nth_run OR
         public.newsapi_articles.collected_at IS DISTINCT FROM EXCLUDED.collected_at
       RETURNING (xmax = 0) AS inserted
     )
@@ -446,7 +495,7 @@ async function bulkUpsertFromTemp(
       COUNT(*) FILTER (WHERE NOT inserted)::int AS db_rows_updated
     FROM upserted
     `,
-    [ingestionSource, runId, collectedAt],
+    [ingestionSource, runId, runType, nthRun, collectedAt],
   );
 
   return {
@@ -457,18 +506,16 @@ async function bulkUpsertFromTemp(
 }
 
 async function main() {
-  const baseOutDir = path.join(process.cwd(), "out");
-  const runDir = pickLatestRunDir(baseOutDir);
+  const baseOutDir = process.cwd();
+  const manifestPath = pickLatestManifestPath(baseOutDir);
+  const runDir = path.dirname(manifestPath);
 
-  const manifestPath = path.join(runDir, "manifest.json");
   const csvPath = path.join(runDir, "articles.csv");
   const loadReportPath = path.join(runDir, "load_report.json");
 
   console.log("Loading artifacts from:", runDir);
 
-  const manifest = JSON.parse(
-    fs.readFileSync(manifestPath, "utf8"),
-  ) as Manifest;
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Manifest;
 
   if (manifest.artifact_contract_version !== ARTIFACT_CONTRACT_VERSION) {
     throw new Error(
@@ -480,10 +527,6 @@ async function main() {
     throw new Error("Manifest missing collected_at — collector incomplete");
   }
 
-  console.log("manifest.run_id:", manifest.run_id);
-  console.log("manifest.ingestion_source:", manifest.ingestion_source);
-  console.log("manifest.artifact_contract_version:", manifest.artifact_contract_version);
-
   const expectedHeader = csvHeader();
   const actualHeader = fs.readFileSync(csvPath, "utf8").split(/\r?\n/, 1)[0];
 
@@ -492,6 +535,12 @@ async function main() {
       `Unexpected CSV header.\nExpected: ${expectedHeader}\nActual:   ${actualHeader}`,
     );
   }
+
+  console.log("manifest.run_id:", manifest.run_id);
+  console.log("manifest.run_type:", manifest.run_type);
+  console.log("manifest.nth_run:", manifest.nth_run);
+  console.log("manifest.ingestion_source:", manifest.ingestion_source);
+  console.log("manifest.artifact_contract_version:", manifest.artifact_contract_version);
 
   const useSSL = !DATABASE_URL.includes("localhost");
   const db = new Client({
@@ -510,6 +559,8 @@ async function main() {
       db,
       manifest.run_id,
       manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
       loadStartedAtIso,
     );
 
@@ -517,11 +568,14 @@ async function main() {
 
     const diagnostics = await collectArtifactDiagnostics(db);
     const { rowsInArtifact, rowsAttempted } = await countArtifactRows(db);
+
     const { rowsLoaded, dbRowsInserted, dbRowsUpdated } =
       await bulkUpsertFromTemp(
         db,
         manifest.ingestion_source,
         manifest.run_id,
+        manifest.run_type,
+        manifest.nth_run,
         manifest.collected_at,
       );
 
@@ -532,6 +586,8 @@ async function main() {
       db,
       manifest.run_id,
       manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
       loadCompletedAtIso,
       rowsLoaded,
       dbRowsInserted,
@@ -544,6 +600,8 @@ async function main() {
       artifact_contract_version: manifest.artifact_contract_version,
       ingestion_source: manifest.ingestion_source,
       run_id: manifest.run_id,
+      run_type: manifest.run_type,
+      nth_run: manifest.nth_run,
       artifacts_dir: runDir,
       csv_header: expectedHeader,
       load_started_at: loadStartedAtIso,
@@ -562,11 +620,7 @@ async function main() {
       pipeline_status: "loaded",
     };
 
-    fs.writeFileSync(
-      loadReportPath,
-      JSON.stringify(loadReport, null, 2),
-      "utf8",
-    );
+    fs.writeFileSync(loadReportPath, JSON.stringify(loadReport, null, 2), "utf8");
     console.log("Load complete:", loadReportPath);
   } catch (e: any) {
     console.error(e);
@@ -582,6 +636,8 @@ async function main() {
         db,
         manifest.run_id,
         manifest.ingestion_source,
+        manifest.run_type,
+        manifest.nth_run,
         "loader_error",
         e?.message ? String(e.message) : String(e),
       );

@@ -10,18 +10,22 @@ import {
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
 import type { S3Event } from "aws-lambda";
-import { csvHeader } from "../shared/newsapi-aiArtifactSchema";
+import {
+  csvHeader,
+  ARTIFACT_CONTRACT_VERSION,
+} from "../shared/newsapi-aiArtifactSchema";
 
 const DATABASE_URL = process.env.DATABASE_URL!;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
-const ARTIFACT_CONTRACT_VERSION = "newsapi-ai/v2";
 const s3 = new S3Client({});
 
 type Manifest = {
   artifact_contract_version?: string;
   ingestion_source: string;
   run_id: string;
+  run_type: string;
+  nth_run: number;
   collected_at: string;
   window_from?: string;
   window_to?: string;
@@ -44,9 +48,7 @@ function parseS3RecordKey(rawKey: string): string {
 }
 
 async function s3GetText(bucket: string, key: string): Promise<string> {
-  const resp = await s3.send(
-    new GetObjectCommand({ Bucket: bucket, Key: key }),
-  );
+  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   if (!resp.Body) {
     throw new Error(`S3 GetObject returned empty body: s3://${bucket}/${key}`);
   }
@@ -58,9 +60,7 @@ async function s3DownloadToFile(
   key: string,
   destPath: string,
 ): Promise<void> {
-  const resp = await s3.send(
-    new GetObjectCommand({ Bucket: bucket, Key: key }),
-  );
+  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   if (!resp.Body) {
     throw new Error(`S3 GetObject returned empty body: s3://${bucket}/${key}`);
   }
@@ -90,17 +90,22 @@ async function setLoadStarted(
   db: Client,
   runId: string,
   ingestionSource: string,
+  runType: string,
+  nthRun: number,
   whenIso: string,
 ) {
   await db.query(
     `
     UPDATE public.pipeline_runs
     SET
-      load_started_at = COALESCE(load_started_at, $3),
+      load_started_at = COALESCE(load_started_at, $5),
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
     `,
-    [runId, ingestionSource, whenIso],
+    [runId, ingestionSource, runType, nthRun, whenIso],
   );
 }
 
@@ -108,6 +113,8 @@ async function setLoadCompleted(
   db: Client,
   runId: string,
   ingestionSource: string,
+  runType: string,
+  nthRun: number,
   whenIso: string,
   rowsLoaded: number,
   dbRowsInserted: number,
@@ -117,19 +124,24 @@ async function setLoadCompleted(
     `
     UPDATE public.pipeline_runs
     SET
-      load_completed_at = $3,
-      rows_loaded = $4,
-      db_rows_inserted = $5,
-      db_rows_updated = $6,
+      load_completed_at = $5,
+      rows_loaded = $6,
+      db_rows_inserted = $7,
+      db_rows_updated = $8,
       status = 'loaded',
       error_code = NULL,
       error_message = NULL,
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
     `,
     [
       runId,
       ingestionSource,
+      runType,
+      nthRun,
       whenIso,
       rowsLoaded,
       dbRowsInserted,
@@ -142,6 +154,8 @@ async function markRunFailed(
   db: Client,
   runId: string,
   ingestionSource: string,
+  runType: string,
+  nthRun: number,
   code: string,
   message: string,
 ) {
@@ -150,12 +164,15 @@ async function markRunFailed(
     UPDATE public.pipeline_runs
     SET
       status = 'failed',
-      error_code = $3,
-      error_message = $4,
+      error_code = $5,
+      error_message = $6,
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
     `,
-    [runId, ingestionSource, code, truncateErrorMessage(message)],
+    [runId, ingestionSource, runType, nthRun, code, truncateErrorMessage(message)],
   );
 }
 
@@ -163,6 +180,8 @@ async function copyCsvIntoTempTable(db: Client, csvPath: string) {
   await db.query(`
     CREATE TEMP TABLE tmp_newsapi_ai_load (
       uri                 text,
+      run_type            text,
+      nth_run             text,
       url                 text,
       title               text,
       body                text,
@@ -198,6 +217,8 @@ async function copyCsvIntoTempTable(db: Client, csvPath: string) {
   const copySql = `
     COPY tmp_newsapi_ai_load (
       uri,
+      run_type,
+      nth_run,
       url,
       title,
       body,
@@ -314,6 +335,8 @@ async function bulkUpsertFromTemp(
   db: Client,
   ingestionSource: string,
   runId: string,
+  runType: string,
+  nthRun: number,
   collectedAt: string,
 ) {
   const res = await db.query(
@@ -352,6 +375,8 @@ async function bulkUpsertFromTemp(
         raw_article,
         ingestion_source,
         run_id,
+        run_type,
+        nth_run,
         collected_at,
         ingested_at
       )
@@ -392,7 +417,9 @@ async function bulkUpsertFromTemp(
         NULLIF(raw_article, '')::jsonb AS raw_article,
         $1 AS ingestion_source,
         $2::timestamptz AS run_id,
-        $3::timestamptz AS collected_at,
+        COALESCE(NULLIF(run_type, ''), $3) AS run_type,
+        COALESCE(NULLIF(nth_run, '')::integer, $4::integer) AS nth_run,
+        $5::timestamptz AS collected_at,
         now() AS ingested_at
       FROM tmp_newsapi_ai_load
       WHERE NULLIF(uri, '') IS NOT NULL
@@ -428,6 +455,8 @@ async function bulkUpsertFromTemp(
         raw_article = EXCLUDED.raw_article,
         ingestion_source = EXCLUDED.ingestion_source,
         run_id = EXCLUDED.run_id,
+        run_type = EXCLUDED.run_type,
+        nth_run = EXCLUDED.nth_run,
         collected_at = EXCLUDED.collected_at,
         updated_at = now()
       WHERE
@@ -462,6 +491,8 @@ async function bulkUpsertFromTemp(
         public.newsapi_articles.raw_article IS DISTINCT FROM EXCLUDED.raw_article OR
         public.newsapi_articles.ingestion_source IS DISTINCT FROM EXCLUDED.ingestion_source OR
         public.newsapi_articles.run_id IS DISTINCT FROM EXCLUDED.run_id OR
+        public.newsapi_articles.run_type IS DISTINCT FROM EXCLUDED.run_type OR
+        public.newsapi_articles.nth_run IS DISTINCT FROM EXCLUDED.nth_run OR
         public.newsapi_articles.collected_at IS DISTINCT FROM EXCLUDED.collected_at
       RETURNING (xmax = 0) AS inserted
     )
@@ -471,7 +502,7 @@ async function bulkUpsertFromTemp(
       COUNT(*) FILTER (WHERE NOT inserted)::int AS db_rows_updated
     FROM upserted
     `,
-    [ingestionSource, runId, collectedAt],
+    [ingestionSource, runId, runType, nthRun, collectedAt],
   );
 
   return {
@@ -515,6 +546,8 @@ export const handler = async (event: S3Event) => {
   const reportKey = `${runPrefix}load_report.json`;
 
   console.log("run_id:", manifest.run_id);
+  console.log("run_type:", manifest.run_type);
+  console.log("nth_run:", manifest.nth_run);
   console.log("ingestion_source:", manifest.ingestion_source);
   console.log("csv_key:", csvKey);
   console.log("report_key:", reportKey);
@@ -552,6 +585,8 @@ export const handler = async (event: S3Event) => {
       db,
       manifest.run_id,
       manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
       loadStartedAtIso,
     );
     console.log("pipeline_run_marked_load_started");
@@ -570,6 +605,8 @@ export const handler = async (event: S3Event) => {
         db,
         manifest.ingestion_source,
         manifest.run_id,
+        manifest.run_type,
+        manifest.nth_run,
         manifest.collected_at,
       );
 
@@ -587,6 +624,8 @@ export const handler = async (event: S3Event) => {
       db,
       manifest.run_id,
       manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
       loadCompletedAtIso,
       rowsLoaded,
       dbRowsInserted,
@@ -601,6 +640,8 @@ export const handler = async (event: S3Event) => {
       artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
       ingestion_source: manifest.ingestion_source,
       run_id: manifest.run_id,
+      run_type: manifest.run_type,
+      nth_run: manifest.nth_run,
       s3_bucket: bucket,
       s3_prefix: runPrefix,
       csv_header: expectedHeader,
@@ -638,6 +679,8 @@ export const handler = async (event: S3Event) => {
         db,
         manifest.run_id,
         manifest.ingestion_source,
+        manifest.run_type,
+        manifest.nth_run,
         "loader_error",
         e?.message ? String(e.message) : String(e),
       );
