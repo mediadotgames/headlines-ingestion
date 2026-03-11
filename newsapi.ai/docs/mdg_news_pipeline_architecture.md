@@ -1,4 +1,3 @@
-
 # MDG News Pipeline – Architecture & Data Model
 
 ## Overview
@@ -19,320 +18,250 @@ The pipeline emphasizes **reproducibility**, **auditability**, and **artifact-ba
 
 # System Architecture
 
-```
-EventRegistry API
-        ↓
-Collector Lambda
-        ↓
-S3 Artifacts
-        ↓
-Loader Lambda
-        ↓
-PostgreSQL Warehouse
-```
+EventRegistry API ↓ Collector (Lambda or Local) ↓ Artifacts (S3 or Local Disk) ↓ Loader (Lambda or Local) ↓ PostgreSQL Warehouse
 
-### Collector Lambda
+The pipeline is intentionally split into **two stages**:
 
-The collector Lambda performs the following tasks:
+| Stage | Purpose |
+|------|------|
+| Collector | Fetches articles and produces artifacts |
+| Loader | Loads artifacts into PostgreSQL |
 
-1. Determines the ingestion window based on Honolulu midnight
-2. Fetches articles from EventRegistry using the REST API
-3. Deduplicates by article URI
-4. Writes ingestion artifacts to S3
-5. Updates the `pipeline_runs` tracking table
+This architecture enables:
 
-Artifacts written to S3 include:
-
-```
-articles.jsonl
-articles.csv
-manifest.json
-```
-
-These artifacts represent the **contract** between the collector and loader.
+- deterministic replays
+- debugging ingestion runs
+- artifact inspection
+- backfilling historical data safely
 
 ---
 
-### S3 Artifact Layout
+# Collector
 
-Artifacts are stored using a deterministic prefix structure:
+The collector performs the following tasks:
 
-```
-s3://<bucket>/<prefix>/
-    ingestion_source=newsapi-ai/
-        run_id=YYYY-MM-DDTHH-MM-SSZ/
-            articles.csv
-            articles.jsonl
-            manifest.json
-            load_report.json
-```
+1. Computes the ingestion window based on **Honolulu midnight**
+2. Determines the logical `run_id`
+3. Reads the environment variable `RUN_TYPE`
+4. Determines the next `nth_run`
+5. Inserts a row into `pipeline_runs`
+6. Fetches articles from EventRegistry
+7. Deduplicates by `uri`
+8. Writes ingestion artifacts
 
-This structure enables:
+Artifacts produced:
 
-- deterministic replay
-- debugging individual runs
-- backfilling historical windows
-- verifying ingestion integrity
+articles.jsonl articles.csv manifest.json
+
+These artifacts form the **contract between collector and loader**.
 
 ---
 
-# Loader Lambda
+# Run Tracking Model
 
-The loader Lambda is triggered when a `manifest.json` file appears in S3.
+The pipeline supports multiple executions for the same logical run window.
 
-The loader performs:
+Two fields define run identity:
 
-1. Download artifact
-2. Validate artifact contract version
-3. Validate CSV header
-4. COPY CSV into a temporary staging table
-5. Perform transactional upsert into `newsapi_articles`
-6. Produce a `load_report.json` diagnostic artifact
+run_type nth_run
 
-Key properties of the loader:
+### run_type
 
-- Uses `ON COMMIT DROP` staging tables
-- Executes within a single database transaction
-- Supports idempotent replays
-- Updates existing rows when enrichment fields change
+Allowed values:
 
----
+scheduled backfill seed
 
-# Artifact Contract
+### nth_run
 
-The artifact contract defines the schema shared between collector and loader.
+Represents the execution count for the same logical run.
 
-Current version:
+Example:
 
-```
-newsapi-ai/v2
-```
+run_id = 2026-03-09T10:00:00Z
 
-Key columns include:
-
-Core article fields:
-
-```
-uri
-url
-title
-body
-date_time
-date_time_published
-lang
-sentiment
-event_uri
-story_uri
-source
-authors
-```
-
-Enrichment fields:
-
-```
-categories
-concepts
-links
-videos
-shares
-duplicate_list
-extracted_dates
-location
-original_article
-raw_article
-```
-
-These fields are serialized as JSON in the artifact and loaded as JSONB in PostgreSQL.
-
----
-
-# Database Schema
-
-Primary table:
-
-```
-public.newsapi_articles
-```
-
-Primary key:
-
-```
-uri
-```
-
-Important metadata columns:
-
-```
-run_id
-ingestion_source
-collected_at
-ingested_at
-```
-
-These fields allow tracking which ingestion run produced each article.
+scheduled nth_run=1 scheduled nth_run=2 backfill nth_run=1
 
 ---
 
 # Pipeline Runs Table
 
-The table `pipeline_runs` tracks ingestion state.
+Table:
 
-Key columns:
+public.pipeline_runs
 
-```
-run_id
-ingestion_source
-window_from
-window_to
-collected_at
-load_started_at
-load_completed_at
-rows_loaded
-db_rows_inserted
-db_rows_updated
-status
-```
+Primary key:
 
-This enables:
+(run_id, ingestion_source, run_type, nth_run)
 
-- run monitoring
-- failure detection
-- debugging ingestion problems
+Important columns:
+
+run_id ingestion_source run_type nth_run window_from window_to collected_at load_started_at load_completed_at rows_loaded db_rows_inserted db_rows_updated status
+
+This allows the system to:
+
+- track retries
+- distinguish backfills
+- audit ingestion history
+- diagnose failures
+
+---
+
+# Articles Table
+
+Primary table:
+
+public.newsapi_articles
+
+Primary key:
+
+uri
+
+Important metadata columns:
+
+run_id ingestion_source run_type nth_run collected_at ingested_at
+
+These fields allow every article row to be traced to the exact pipeline execution that produced or last updated it.
+
+---
+
+# Artifact Contract
+
+Current contract version:
+
+newsapi-ai/v3
+
+This contract defines the shared schema between collector and loader.
+
+Key metadata fields:
+
+run_id run_type nth_run ingestion_source collected_at
+
+Core article fields include:
+
+uri url title body date_time date_time_published lang sentiment event_uri story_uri source authors
+
+Enrichment fields include:
+
+categories concepts links videos shares duplicate_list extracted_dates location original_article raw_article
+
+These fields are stored as JSON in artifacts and loaded into PostgreSQL JSONB columns.
+
+---
+
+# Artifact Storage Layout
+
+Artifacts are written to deterministic paths.
+
+ingestion_source=newsapi-ai/ run_id=YYYY-MM-DDTHH-MM-SSZ/ run_type=scheduled|backfill|seed/ nth_run=N/ articles.jsonl articles.csv manifest.json load_report.json
+
+Example:
+
+s3://bucket/prefix/ ingestion_source=newsapi-ai/ run_id=2026-03-09T10-00-00Z/ run_type=scheduled/ nth_run=1/ manifest.json
+
+Benefits:
+
+- prevents artifact overwrites
+- allows multiple executions
+- supports deterministic replay
+- enables debugging of individual runs
+
+---
+
+# Loader
+
+The loader is triggered when a `manifest.json` file appears.
+
+Loader responsibilities:
+
+1. Download artifact files
+2. Validate artifact contract version
+3. Validate CSV header
+4. Read `run_id`, `run_type`, and `nth_run`
+5. COPY CSV into a temporary staging table
+6. Perform transactional UPSERT into `newsapi_articles`
+7. Update the exact `pipeline_runs` row
+8. Produce `load_report.json`
+
+Loader guarantees:
+
+- transactional safety
+- idempotent loads
+- deterministic artifact replay
+- detailed ingestion diagnostics
 
 ---
 
 # Time Window Model
 
-The pipeline uses a deterministic time model based on **Honolulu midnight**.
+The pipeline uses **Honolulu midnight** as the canonical boundary.
 
-This ensures that the entire U.S. news cycle is captured before a run executes.
+This ensures the full U.S. news cycle is complete before ingestion runs.
 
 Example schedule:
 
-```
 00:05 Pacific/Honolulu
-```
 
-Window controls:
+Environment variables:
 
-```
-LOOKBACK_DAYS
-WINDOW_END_DAYS_AGO
-```
+LOOKBACK_DAYS WINDOW_END_DAYS_AGO RUN_TYPE
 
-These environment variables allow easy historical backfills.
+These variables allow:
+
+- historical backfills
+- seed runs
+- scheduled ingestion
 
 ---
 
 # Enrichment Data Model
 
-The enrichment fields convert articles into a structured knowledge graph.
+Articles are enriched with structured metadata.
 
-### Concepts
+## Concepts
 
-Concepts represent normalized entities:
+Concepts represent normalized entities such as:
 
-```
-people
-organizations
-locations
-topics
-events
-```
+people organizations locations topics events
 
-Example:
+Examples:
 
-```
-Donald Trump
-United States Congress
-Artificial Intelligence
-Pentagon
-```
+Donald Trump Pentagon Artificial Intelligence United States Congress
 
-Concepts enable semantic clustering and narrative analysis.
+Concepts enable semantic clustering.
 
 ---
 
-### Categories
+## Categories
 
-Categories represent hierarchical topic classifications:
+Categories represent hierarchical topics.
 
-```
-news/Politics
-news/Technology
-dmoz/Society/Law
-```
+Examples:
 
-These enable topic-level aggregation and trend analysis.
+news/Politics news/Technology dmoz/Society/Law
+
+These enable topic-level aggregation.
 
 ---
 
-### Location
+## Location
 
-Location metadata identifies geographic context for events described in articles.
+Location metadata represents geographic context.
 
-This enables geographic coverage analysis.
+Used for:
 
----
-
-### Links
-
-Links represent URLs referenced inside article bodies.
-
-These can be used to build citation graphs between news articles.
+- regional news coverage analysis
+- geographic clustering
+- international media comparison
 
 ---
 
 # Clustering Foundations
 
-The enrichment fields allow clustering articles into stories or topics.
+The enrichment data enables article clustering using signals such as:
 
-Signals used for clustering include:
+shared concepts shared categories event_uri story_uri publication timestamps source relationships
 
-```
-shared concepts
-shared categories
-event_uri
-story_uri
-publication timestamps
-source relationships
-```
-
-Concept overlap is particularly powerful for clustering because articles discussing the same entities are often describing the same story.
-
----
-
-# Analytical Use Cases
-
-With the enriched dataset the system can support:
-
-- topic trend analysis
-- event clustering
-- narrative tracking
-- media coverage comparison
-- coverage omission detection
-
-Example questions the dataset can answer:
-
-```
-Which outlets covered a given political event?
-Which outlets ignored a major story?
-Which entities dominate the news cycle?
-How does coverage differ across sources?
-```
-
----
-
-# Observability
-
-Pipeline observability includes:
-
-- CloudWatch logs for both Lambdas
-- `pipeline_runs` status tracking
-- `load_report.json` diagnostic artifacts
-- artifact contract validation
-
-This design ensures that ingestion failures are detectable and debuggable.
+Concept overlap is particularly useful for detecting stories covered by multiple outlets.
 
 ---
 
@@ -340,18 +269,11 @@ This design ensures that ingestion failures are detectable and debuggable.
 
 Planned enhancements include:
 
-- normalized concept tables for faster clustering queries
-- article similarity indexes
-- event-level clustering services
-- public-interest classification models
-- coverage heatmap visualizations
+- normalized concept tables
+- article similarity indexing
+- event-level clustering
+- public-interest scoring
+- media coverage heatmaps
 
-These capabilities build on the structured enrichment data already present in the pipeline.
+These capabilities build on the structured enrichment model already present in the pipeline.
 
----
-
-# Summary
-
-The MDG News Pipeline transforms raw news articles into a structured dataset suitable for large-scale media analysis.
-
-Through enrichment, artifact-based ingestion, and transactional loading, the system provides a reliable foundation for analyzing news narratives, detecting coverage patterns, and clustering related stories across multiple media outlets.

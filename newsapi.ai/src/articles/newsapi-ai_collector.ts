@@ -3,22 +3,39 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Client } from "pg";
 import { DateTime } from "luxon";
-import { csvHeader, toCsvRow, ARTIFACT_CONTRACT_VERSION } from "./shared/newsapi-aiArtifactSchema";
+import {
+  csvHeader,
+  toCsvRow,
+  ARTIFACT_CONTRACT_VERSION,
+} from "./shared/newsapi-aiArtifactSchema";
+import {
+  sleep,
+  isRetryableStatus,
+  isRetryableError,
+  backoffDelayMs,
+} from "./shared/retry";
+
 console.log("collector starting...");
+
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
 const DATABASE_URL = process.env.DATABASE_URL!;
 const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS ?? 2);
+const WINDOW_END_DAYS_AGO = Number(process.env.WINDOW_END_DAYS_AGO ?? 0);
+const RUN_TYPE = (process.env.RUN_TYPE ?? "scheduled").trim().toLowerCase();
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
-if (!EVENTREGISTRY_SOURCE_URIS)
-  throw new Error("Missing EVENTREGISTRY_SOURCE_URIS");
+if (!EVENTREGISTRY_SOURCE_URIS) throw new Error("Missing EVENTREGISTRY_SOURCE_URIS");
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
+if (!["scheduled", "backfill", "seed"].includes(RUN_TYPE)) {
+  throw new Error(`Invalid RUN_TYPE: ${RUN_TYPE}`);
+}
 
 const INGESTION_SOURCE = "newsapi-ai";
 const CANON_TZ = "Pacific/Honolulu";
 const PAGE_SIZE = 100;
 const MAX_PAGES = 500;
+const FETCH_MAX_ATTEMPTS = 5;
 
 const sourceUris = EVENTREGISTRY_SOURCE_URIS.split(",")
   .map((s) => s.trim())
@@ -57,7 +74,6 @@ type NewsApiAiArticle = {
   image?: string | null;
   source?: Source;
   authors?: Author[] | null;
-
   categories?: Category[] | null;
   concepts?: Concept[] | null;
   links?: string[] | null;
@@ -68,7 +84,6 @@ type NewsApiAiArticle = {
   extractedDates?: ExtractedDate[] | null;
   location?: Location;
   originalArticle?: OriginalArticle;
-
   sim?: number | null;
   wgt?: number | null;
 };
@@ -102,9 +117,12 @@ function computeHonoluluWindowUtc(): {
   windowFromLocal: DateTime;
   windowToLocal: DateTime;
 } {
-  const windowToLocal = DateTime.now().setZone(CANON_TZ).startOf("day");
-  const windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
+  const windowToLocal = DateTime.now()
+    .setZone(CANON_TZ)
+    .startOf("day")
+    .minus({ days: WINDOW_END_DAYS_AGO });
 
+  const windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
@@ -186,58 +204,117 @@ async function fetchPage(args: {
     includeLocationCountryContinent: true,
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
 
-  const json = (await res.json().catch(() => ({}))) as EventRegistryResponse;
+      const json = (await res.json().catch(() => ({}))) as EventRegistryResponse;
 
-  if (!res.ok) {
-    throw new Error(
-      `Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`,
-    );
+      if (!res.ok) {
+        const message = `Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`;
+
+        if (isRetryableStatus(res.status) && attempt < FETCH_MAX_ATTEMPTS) {
+          const delayMs = backoffDelayMs(attempt);
+          console.warn(
+            `page ${args.page}: retryable API error on attempt ${attempt}/${FETCH_MAX_ATTEMPTS}: ${message}; sleeping ${delayMs}ms`,
+          );
+          await sleep(delayMs);
+          continue;
+        }
+
+        throw new Error(message);
+      }
+
+      const errMsg = firstErrorMessage(json);
+      if (errMsg) {
+        throw new Error(`Event Registry error: ${errMsg}`);
+      }
+
+      return { articles: extractArticles(json), raw: json };
+    } catch (err) {
+      if (attempt < FETCH_MAX_ATTEMPTS && isRetryableError(err)) {
+        const delayMs = backoffDelayMs(attempt);
+        console.warn(
+          `page ${args.page}: retryable fetch failure on attempt ${attempt}/${FETCH_MAX_ATTEMPTS}: ${
+            err instanceof Error ? err.message : String(err)
+          }; sleeping ${delayMs}ms`,
+        );
+        await sleep(delayMs);
+        continue;
+      }
+
+      throw err;
+    }
   }
 
-  const errMsg = firstErrorMessage(json);
-  if (errMsg) {
-    throw new Error(`Event Registry error: ${errMsg}`);
-  }
-
-  return { articles: extractArticles(json), raw: json };
+  throw new Error(`page ${args.page}: exhausted retries`);
 }
 
-async function upsertPipelineRunStarted(
+async function reservePipelineRun(
   db: Client,
   args: {
     runId: Date;
     ingestionSource: string;
+    runType: string;
     windowFrom: Date;
     windowTo: Date;
   },
-) {
-  const sql = `
-    INSERT INTO public.pipeline_runs (
-      run_id, ingestion_source, window_from, window_to,
-      status, created_at, updated_at
-    )
-    VALUES ($1, $2, $3, $4, 'started', now(), now())
-    ON CONFLICT (run_id, ingestion_source) DO UPDATE SET
-      window_from = EXCLUDED.window_from,
-      window_to = EXCLUDED.window_to,
-      status = 'started',
-      error_code = NULL,
-      error_message = NULL,
-      updated_at = now()
-  `;
+): Promise<number> {
+  await db.query("BEGIN");
+  try {
+    await db.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1 || '|' || $2 || '|' || $3))`,
+      [args.runId.toISOString(), args.ingestionSource, args.runType],
+    );
 
-  await db.query(sql, [
-    args.runId,
-    args.ingestionSource,
-    args.windowFrom,
-    args.windowTo,
-  ]);
+    const nextNthRunRes = await db.query(
+      `
+      SELECT COALESCE(MAX(nth_run), 0) + 1 AS next_nth_run
+      FROM public.pipeline_runs
+      WHERE run_id = $1
+        AND ingestion_source = $2
+        AND run_type = $3
+      `,
+      [args.runId, args.ingestionSource, args.runType],
+    );
+
+    const nthRun = Number(nextNthRunRes.rows[0].next_nth_run);
+
+    await db.query(
+      `
+      INSERT INTO public.pipeline_runs (
+        run_id,
+        ingestion_source,
+        run_type,
+        nth_run,
+        window_from,
+        window_to,
+        status,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'started', now(), now())
+      `,
+      [
+        args.runId,
+        args.ingestionSource,
+        args.runType,
+        nthRun,
+        args.windowFrom,
+        args.windowTo,
+      ],
+    );
+
+    await db.query("COMMIT");
+    return nthRun;
+  } catch (e) {
+    await db.query("ROLLBACK");
+    throw e;
+  }
 }
 
 async function updatePipelineRunCollected(
@@ -245,6 +322,8 @@ async function updatePipelineRunCollected(
   args: {
     runId: Date;
     ingestionSource: string;
+    runType: string;
+    nthRun: number;
     collectedAt: Date;
     articlesFetched: number;
     articlesDeduped: number;
@@ -253,19 +332,24 @@ async function updatePipelineRunCollected(
   const sql = `
     UPDATE public.pipeline_runs
     SET
-      collected_at = $3,
-      articles_fetched = $4,
-      articles_deduped = $5,
+      collected_at = $5,
+      articles_fetched = $6,
+      articles_deduped = $7,
       status = 'collected',
       error_code = NULL,
       error_message = NULL,
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
   `;
 
   await db.query(sql, [
     args.runId,
     args.ingestionSource,
+    args.runType,
+    args.nthRun,
     args.collectedAt,
     args.articlesFetched,
     args.articlesDeduped,
@@ -277,6 +361,8 @@ async function markPipelineRunFailed(
   args: {
     runId: Date;
     ingestionSource: string;
+    runType: string;
+    nthRun: number;
     errorCode?: string;
     errorMessage: string;
   },
@@ -285,15 +371,20 @@ async function markPipelineRunFailed(
     UPDATE public.pipeline_runs
     SET
       status = 'failed',
-      error_code = $3,
-      error_message = $4,
+      error_code = $5,
+      error_message = $6,
       updated_at = now()
-    WHERE run_id = $1 AND ingestion_source = $2
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
   `;
 
   await db.query(sql, [
     args.runId,
     args.ingestionSource,
+    args.runType,
+    args.nthRun,
     args.errorCode ?? null,
     args.errorMessage,
   ]);
@@ -322,15 +413,13 @@ async function main() {
   }
 
   console.log("ingestion_source:", INGESTION_SOURCE);
+  console.log("run_type:", RUN_TYPE);
+  console.log("artifact_contract_version:", ARTIFACT_CONTRACT_VERSION);
   console.log("canonical_tz:", CANON_TZ);
-  console.log("run_id (UTC instant of Honolulu midnight):", run_id);
+  console.log("run_id:", run_id);
   console.log("window (UTC):", window_from, "->", window_to);
-  console.log(
-    "window (Honolulu local):",
-    window_from_local,
-    "->",
-    window_to_local,
-  );
+  console.log("window (Honolulu local):", window_from_local, "->", window_to_local);
+  console.log("fetch_max_attempts:", FETCH_MAX_ATTEMPTS);
   console.log("source_uris:", sourceUris);
 
   const useSSL = !DATABASE_URL.includes("localhost");
@@ -340,15 +429,21 @@ async function main() {
   });
   await db.connect();
 
+  let nth_run: number | null = null;
+
   try {
-    await upsertPipelineRunStarted(db, {
+    nth_run = await reservePipelineRun(db, {
       runId: runIdUtc.toJSDate(),
       ingestionSource: INGESTION_SOURCE,
+      runType: RUN_TYPE,
       windowFrom: windowFromUtc.toJSDate(),
       windowTo: windowToUtc.toJSDate(),
     });
 
+    console.log("nth_run:", nth_run);
+
     const hardFromMs = windowFromUtc.toMillis();
+    const hardToMs = windowToUtc.toMillis();
     const byUri = new Map<string, NewsApiAiArticle>();
     let totalFetched = 0;
 
@@ -363,7 +458,6 @@ async function main() {
       if (articles.length === 0) break;
 
       totalFetched += articles.length;
-
       let oldestMsOnPage: number | null = null;
 
       for (const article of articles) {
@@ -372,7 +466,7 @@ async function main() {
 
         const articleMs = parseArticleDateMs(article);
         if (articleMs != null) {
-          if (articleMs < hardFromMs || articleMs >= windowToUtc.toMillis()) {
+          if (articleMs < hardFromMs || articleMs >= hardToMs) {
             if (oldestMsOnPage == null || articleMs < oldestMsOnPage) {
               oldestMsOnPage = articleMs;
             }
@@ -388,17 +482,13 @@ async function main() {
 
       if (articles.length < PAGE_SIZE) break;
       if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
-        console.log(
-          "Stopping early because oldest article on a page crossed window_from",
-        );
+        console.log("Stopping early because oldest article on a page crossed window_from");
         break;
       }
     }
 
     if (byUri.size === 0) {
-      throw new Error(
-        "Collector fetched zero articles — aborting artifact write",
-      );
+      throw new Error("Collector fetched zero articles — aborting artifact write");
     }
 
     const deduped = Array.from(byUri.values());
@@ -414,6 +504,8 @@ async function main() {
     await updatePipelineRunCollected(db, {
       runId: runIdUtc.toJSDate(),
       ingestionSource: INGESTION_SOURCE,
+      runType: RUN_TYPE,
+      nthRun: nth_run,
       collectedAt,
       articlesFetched: totalFetched,
       articlesDeduped: deduped.length,
@@ -424,6 +516,8 @@ async function main() {
       "out",
       `ingestion_source=${INGESTION_SOURCE}`,
       `run_id=${run_id.replace(/:/g, "-")}`,
+      `run_type=${RUN_TYPE}`,
+      `nth_run=${nth_run}`,
     );
     fs.mkdirSync(outDir, { recursive: true });
 
@@ -437,6 +531,8 @@ async function main() {
           JSON.stringify({
             ingestion_source: INGESTION_SOURCE,
             run_id,
+            run_type: RUN_TYPE,
+            nth_run,
             collected_at,
             window_from,
             window_to,
@@ -478,6 +574,8 @@ async function main() {
     const rows = deduped.map((a) =>
       toCsvRow({
         uri: a.uri == null ? "" : String(a.uri),
+        run_type: RUN_TYPE,
+        nth_run: String(nth_run),
         url: a.url ?? "",
         title: a.title ?? "",
         body: a.body ?? "",
@@ -510,17 +608,15 @@ async function main() {
       }),
     );
 
-    fs.writeFileSync(
-      csvPath,
-      csvHeader() + "\n" + rows.join("\n") + "\n",
-      "utf8",
-    );
+    fs.writeFileSync(csvPath, csvHeader() + "\n" + rows.join("\n") + "\n", "utf8");
 
     const manifest = {
       artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
       ingestion_source: INGESTION_SOURCE,
       canonical_tz: CANON_TZ,
       run_id,
+      run_type: RUN_TYPE,
+      nth_run,
       window_from,
       window_to,
       collected_at,
@@ -548,15 +644,19 @@ async function main() {
     const msg = e?.message ? String(e.message) : String(e);
     console.error(e);
 
-    try {
-      await markPipelineRunFailed(db, {
-        runId: runIdUtc.toJSDate(),
-        ingestionSource: INGESTION_SOURCE,
-        errorCode: "collector_error",
-        errorMessage: msg.slice(0, 2000),
-      });
-    } catch (inner) {
-      console.error("Also failed to mark pipeline_runs as failed:", inner);
+    if (nth_run != null) {
+      try {
+        await markPipelineRunFailed(db, {
+          runId: runIdUtc.toJSDate(),
+          ingestionSource: INGESTION_SOURCE,
+          runType: RUN_TYPE,
+          nthRun: nth_run,
+          errorCode: "collector_error",
+          errorMessage: msg.slice(0, 2000),
+        });
+      } catch (inner) {
+        console.error("Also failed to mark pipeline_runs as failed:", inner);
+      }
     }
 
     process.exitCode = 1;
