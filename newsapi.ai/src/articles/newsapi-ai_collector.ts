@@ -23,6 +23,7 @@ const DATABASE_URL = process.env.DATABASE_URL!;
 const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS ?? 2);
 const WINDOW_END_DAYS_AGO = Number(process.env.WINDOW_END_DAYS_AGO ?? 0);
 const RUN_TYPE = (process.env.RUN_TYPE ?? "scheduled").trim().toLowerCase();
+const BACKFILL_LOCAL_DATE = (process.env.BACKFILL_LOCAL_DATE ?? "").trim();
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
 if (!EVENTREGISTRY_SOURCE_URIS) throw new Error("Missing EVENTREGISTRY_SOURCE_URIS");
@@ -110,22 +111,48 @@ function isoOrThrow(dt: DateTime, label: string): string {
   return s;
 }
 
-function computeHonoluluWindowUtc(): {
+function computeWindow(): {
   runIdUtc: DateTime;
   windowFromUtc: DateTime;
   windowToUtc: DateTime;
   windowFromLocal: DateTime;
   windowToLocal: DateTime;
+  dateStart: string;
+  dateEnd: string;
+  mode: "explicit_local_date" | "rolling_window";
 } {
-  const windowToLocal = DateTime.now()
-    .setZone(CANON_TZ)
-    .startOf("day")
-    .minus({ days: WINDOW_END_DAYS_AGO });
+  let windowFromLocal: DateTime;
+  let windowToLocal: DateTime;
+  let mode: "explicit_local_date" | "rolling_window";
 
-  const windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
+  if (BACKFILL_LOCAL_DATE) {
+    const parsed = DateTime.fromISO(BACKFILL_LOCAL_DATE, { zone: CANON_TZ }).startOf("day");
+    if (!parsed.isValid) {
+      throw new Error(`Invalid BACKFILL_LOCAL_DATE: ${BACKFILL_LOCAL_DATE}`);
+    }
+    windowFromLocal = parsed;
+    windowToLocal = parsed.plus({ days: 1 });
+    mode = "explicit_local_date";
+  } else {
+    windowToLocal = DateTime.now()
+      .setZone(CANON_TZ)
+      .startOf("day")
+      .minus({ days: WINDOW_END_DAYS_AGO });
+
+    windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
+    mode = "rolling_window";
+  }
+
   const windowToUtc = windowToLocal.toUTC();
   const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
+
+  const dateStart = windowFromUtc.toISODate();
+  const dateEnd = windowToUtc.toISODate();
+
+  if (!dateStart || !dateEnd) {
+    throw new Error("Failed to compute dateStart/dateEnd in YYYY-MM-DD format");
+  }
 
   return {
     runIdUtc,
@@ -133,6 +160,9 @@ function computeHonoluluWindowUtc(): {
     windowToUtc,
     windowFromLocal,
     windowToLocal,
+    dateStart,
+    dateEnd,
+    mode,
   };
 }
 
@@ -397,7 +427,10 @@ async function main() {
     windowToUtc,
     windowFromLocal,
     windowToLocal,
-  } = computeHonoluluWindowUtc();
+    dateStart,
+    dateEnd,
+    mode,
+  } = computeWindow();
 
   const run_id = isoOrThrow(runIdUtc, "run_id");
   const window_from = isoOrThrow(windowFromUtc, "window_from");
@@ -405,13 +438,8 @@ async function main() {
   const window_from_local = isoOrThrow(windowFromLocal, "window_from_local");
   const window_to_local = isoOrThrow(windowToLocal, "window_to_local");
 
-  const date_start = windowFromUtc.toISODate();
-  const date_end = windowToUtc.toISODate();
-
-  if (!date_start || !date_end) {
-    throw new Error("Failed to compute dateStart/dateEnd in YYYY-MM-DD format");
-  }
-
+  console.log("mode:", mode);
+  console.log("backfill_local_date:", BACKFILL_LOCAL_DATE || null);
   console.log("ingestion_source:", INGESTION_SOURCE);
   console.log("run_type:", RUN_TYPE);
   console.log("artifact_contract_version:", ARTIFACT_CONTRACT_VERSION);
@@ -419,6 +447,8 @@ async function main() {
   console.log("run_id:", run_id);
   console.log("window (UTC):", window_from, "->", window_to);
   console.log("window (Honolulu local):", window_from_local, "->", window_to_local);
+  console.log("api_date_start:", dateStart);
+  console.log("api_date_end:", dateEnd);
   console.log("fetch_max_attempts:", FETCH_MAX_ATTEMPTS);
   console.log("source_uris:", sourceUris);
 
@@ -446,19 +476,27 @@ async function main() {
     const hardToMs = windowToUtc.toMillis();
     const byUri = new Map<string, NewsApiAiArticle>();
     let totalFetched = 0;
+    let consecutiveEarlyStopQualifiedPages = 0;
 
     for (let page = 1; page <= MAX_PAGES; page++) {
       const { articles } = await fetchPage({
         page,
-        dateStart: date_start,
-        dateEnd: date_end,
+        dateStart,
+        dateEnd,
       });
 
       console.log(`page ${page}: batch=${articles.length}`);
       if (articles.length === 0) break;
 
       totalFetched += articles.length;
+
+      const pageUris = articles
+        .map((a) => (a.uri == null ? "" : String(a.uri).trim()))
+        .filter(Boolean);
+      const uniquePageUris = new Set(pageUris);
+
       let oldestMsOnPage: number | null = null;
+      const sizeBefore = byUri.size;
 
       for (const article of articles) {
         const uri = article.uri == null ? "" : String(article.uri).trim();
@@ -480,10 +518,36 @@ async function main() {
         byUri.set(uri, article);
       }
 
+      const sizeAfter = byUri.size;
+      const newUniqueUrisAdded = sizeAfter - sizeBefore;
+
+      console.log(`page ${page}: unique_uris_in_batch=${uniquePageUris.size}`);
+      console.log(`page ${page}: new_unique_uris_added=${newUniqueUrisAdded}`);
+      console.log(`page ${page}: sample_uris=${JSON.stringify(pageUris.slice(0, 5))}`);
+
       if (articles.length < PAGE_SIZE) break;
+
       if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
-        console.log("Stopping early because oldest article on a page crossed window_from");
-        break;
+        if (newUniqueUrisAdded === 0) {
+          console.warn(
+            `page ${page}: oldest article crossed window_from, but page added 0 new URIs; possible repeated page, ignoring early-stop`,
+          );
+          consecutiveEarlyStopQualifiedPages = 0;
+        } else {
+          consecutiveEarlyStopQualifiedPages += 1;
+          console.log(
+            `page ${page}: early-stop-qualified page count=${consecutiveEarlyStopQualifiedPages} (new_unique_uris_added=${newUniqueUrisAdded})`,
+          );
+
+          if (consecutiveEarlyStopQualifiedPages >= 2) {
+            console.log(
+              `page ${page}: stopping early after ${consecutiveEarlyStopQualifiedPages} consecutive early-stop-qualified pages`,
+            );
+            break;
+          }
+        }
+      } else {
+        consecutiveEarlyStopQualifiedPages = 0;
       }
     }
 
@@ -629,7 +693,7 @@ async function main() {
       page_size: PAGE_SIZE,
       max_pages: MAX_PAGES,
       pagination_optimization:
-        "stop once oldest article on a page is older than window_from",
+        "stop after 2 consecutive early-stop-qualified pages that still add new URIs",
       schedule_recommendation: {
         service: "EventBridge Scheduler",
         timezone: CANON_TZ,
