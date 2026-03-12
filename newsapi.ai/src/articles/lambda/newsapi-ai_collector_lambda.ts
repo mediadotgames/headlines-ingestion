@@ -8,13 +8,13 @@ import {
   csvHeader,
   toCsvRow,
   ARTIFACT_CONTRACT_VERSION,
-} from "../../shared/newsapi-aiArtifactSchema";
+} from "../shared/newsapi-aiArtifactSchema";
 import {
   sleep,
   isRetryableStatus,
   isRetryableError,
   backoffDelayMs,
-} from "../../shared/retry";
+} from "../shared/retry";
 
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = process.env.EVENTREGISTRY_SOURCE_URIS!;
