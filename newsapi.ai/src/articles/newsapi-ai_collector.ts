@@ -13,7 +13,7 @@ import {
   isRetryableStatus,
   isRetryableError,
   backoffDelayMs,
-} from "./shared/retry";
+} from "../shared/retry";
 
 console.log("collector starting...");
 

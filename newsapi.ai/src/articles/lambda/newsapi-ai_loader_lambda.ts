@@ -163,6 +163,96 @@ async function setLoadCompleted(
   );
 }
 
+async function upsertPipelineRunMetrics(
+  db: Client,
+  runId: string,
+  ingestionSource: string,
+  runType: string,
+  nthRun: number,
+) {
+  const res = await db.query(
+    `
+    WITH article_scope AS (
+      SELECT
+        a.uri,
+        a.source_uri
+      FROM public.newsapi_articles a
+      WHERE a.run_id = $1
+        AND a.ingestion_source = $2
+        AND a.run_type = $3
+        AND a.nth_run = $4
+    ),
+    metrics AS (
+      SELECT 'articles_upserted'::text AS metric_name, COUNT(*)::bigint AS metric_value
+      FROM article_scope
+
+      UNION ALL
+
+      SELECT 'articles_with_source_uri'::text, COUNT(*)::bigint
+      FROM article_scope
+      WHERE source_uri IS NOT NULL
+
+      UNION ALL
+
+      SELECT 'distinct_sources_in_articles'::text, COUNT(DISTINCT source_uri)::bigint
+      FROM article_scope
+      WHERE source_uri IS NOT NULL
+
+      UNION ALL
+
+      SELECT 'article_concept_links'::text, COUNT(*)::bigint
+      FROM public.newsapi_article_concepts ac
+      JOIN article_scope a
+        ON a.uri = ac.article_uri
+
+      UNION ALL
+
+      SELECT 'distinct_concepts_linked'::text, COUNT(DISTINCT ac.concept_uri)::bigint
+      FROM public.newsapi_article_concepts ac
+      JOIN article_scope a
+        ON a.uri = ac.article_uri
+
+      UNION ALL
+
+      SELECT 'article_category_links'::text, COUNT(*)::bigint
+      FROM public.newsapi_article_categories ac
+      JOIN article_scope a
+        ON a.uri = ac.article_uri
+
+      UNION ALL
+
+      SELECT 'distinct_categories_linked'::text, COUNT(DISTINCT ac.category_uri)::bigint
+      FROM public.newsapi_article_categories ac
+      JOIN article_scope a
+        ON a.uri = ac.article_uri
+    )
+    INSERT INTO public.pipeline_run_metrics (
+      run_id,
+      ingestion_source,
+      run_type,
+      nth_run,
+      metric_name,
+      metric_value
+    )
+    SELECT
+      $1::timestamptz,
+      $2::text,
+      $3::text,
+      $4::integer,
+      metric_name,
+      metric_value
+    FROM metrics
+    ON CONFLICT (run_id, ingestion_source, run_type, nth_run, metric_name)
+    DO UPDATE SET
+      metric_value = EXCLUDED.metric_value
+    RETURNING metric_name, metric_value
+    `,
+    [runId, ingestionSource, runType, nthRun],
+  );
+
+  return res.rows as Array<{ metric_name: string; metric_value: string | number }>;
+}
+
 async function markRunFailed(
   db: Client,
   runId: string,
@@ -583,6 +673,272 @@ async function bulkUpsertFromTemp(
   };
 }
 
+
+async function syncNormalizedArticleDimensionsFromTemp(db: Client) {
+  await db.query(
+    `
+    INSERT INTO public.newsapi_sources (
+      uri,
+      title,
+      description,
+      social_media,
+      ranking,
+      location,
+      image,
+      thumb_image
+    )
+    SELECT DISTINCT ON (src.uri)
+      src.uri,
+      src.title,
+      src.description,
+      src.social_media,
+      src.ranking,
+      src.location,
+      src.image,
+      src.thumb_image
+    FROM (
+      SELECT
+        NULLIF((NULLIF(t.source, '')::jsonb)->>'uri', '') AS uri,
+        NULLIF((NULLIF(t.source, '')::jsonb)->>'title', '') AS title,
+        NULLIF((NULLIF(t.source, '')::jsonb)->>'description', '') AS description,
+        (NULLIF(t.source, '')::jsonb)->'socialMedia' AS social_media,
+        (NULLIF(t.source, '')::jsonb)->'ranking' AS ranking,
+        (NULLIF(t.source, '')::jsonb)->'location' AS location,
+        NULLIF((NULLIF(t.source, '')::jsonb)->>'image', '') AS image,
+        NULLIF((NULLIF(t.source, '')::jsonb)->>'thumbImage', '') AS thumb_image
+      FROM tmp_newsapi_ai_load t
+      WHERE NULLIF(t.uri, '') IS NOT NULL
+        AND NULLIF(t.source, '') IS NOT NULL
+        AND NULLIF(t.source, '') <> 'null'
+        AND jsonb_typeof(NULLIF(t.source, '')::jsonb) = 'object'
+        AND (NULLIF(t.source, '')::jsonb ? 'uri')
+    ) src
+    WHERE src.uri IS NOT NULL
+    ORDER BY
+      src.uri,
+      (NULLIF(src.description, '') IS NOT NULL) DESC,
+      (NULLIF(src.image, '') IS NOT NULL) DESC,
+      (NULLIF(src.thumb_image, '') IS NOT NULL) DESC,
+      (src.social_media IS NOT NULL) DESC,
+      (src.ranking IS NOT NULL) DESC,
+      (src.location IS NOT NULL) DESC,
+      src.title DESC NULLS LAST
+    ON CONFLICT (uri) DO UPDATE
+    SET
+      title = COALESCE(EXCLUDED.title, public.newsapi_sources.title),
+      description = COALESCE(EXCLUDED.description, public.newsapi_sources.description),
+      social_media = COALESCE(EXCLUDED.social_media, public.newsapi_sources.social_media),
+      ranking = COALESCE(EXCLUDED.ranking, public.newsapi_sources.ranking),
+      location = COALESCE(EXCLUDED.location, public.newsapi_sources.location),
+      image = COALESCE(EXCLUDED.image, public.newsapi_sources.image),
+      thumb_image = COALESCE(EXCLUDED.thumb_image, public.newsapi_sources.thumb_image),
+      updated_at = now()
+    `,
+  );
+
+  await db.query(
+    `
+    WITH normalized_sources AS (
+      SELECT
+        NULLIF(t.uri, '') AS article_uri,
+        CASE
+          WHEN NULLIF(t.source, '') IS NOT NULL
+            AND NULLIF(t.source, '') <> 'null'
+            AND jsonb_typeof(NULLIF(t.source, '')::jsonb) = 'object'
+            AND (NULLIF(t.source, '')::jsonb ? 'uri')
+          THEN NULLIF((NULLIF(t.source, '')::jsonb)->>'uri', '')
+          ELSE NULL
+        END AS source_uri
+      FROM tmp_newsapi_ai_load t
+      WHERE NULLIF(t.uri, '') IS NOT NULL
+    )
+    UPDATE public.newsapi_articles a
+    SET
+      source_uri = s.source_uri,
+      updated_at = now()
+    FROM normalized_sources s
+    WHERE a.uri = s.article_uri
+      AND a.source_uri IS DISTINCT FROM s.source_uri
+    `,
+  );
+
+  await db.query(
+    `
+    INSERT INTO public.newsapi_concepts (
+      uri,
+      type,
+      image,
+      label,
+      location,
+      synonyms
+    )
+    SELECT DISTINCT ON (c.uri)
+      c.uri,
+      c.type,
+      c.image,
+      c.label,
+      c.location,
+      c.synonyms
+    FROM (
+      SELECT
+        NULLIF(concept->>'uri', '') AS uri,
+        NULLIF(concept->>'type', '') AS type,
+        NULLIF(concept->>'image', '') AS image,
+        concept->'label' AS label,
+        concept->'location' AS location,
+        concept->'synonyms' AS synonyms
+      FROM tmp_newsapi_ai_load t
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE
+          WHEN NULLIF(t.concepts, '') IS NOT NULL
+            AND NULLIF(t.concepts, '') <> 'null'
+            AND jsonb_typeof(NULLIF(t.concepts, '')::jsonb) = 'array'
+          THEN NULLIF(t.concepts, '')::jsonb
+          ELSE '[]'::jsonb
+        END
+      ) AS concept
+      WHERE NULLIF(t.uri, '') IS NOT NULL
+        AND concept ? 'uri'
+        AND NULLIF(concept->>'uri', '') IS NOT NULL
+    ) c
+    ORDER BY
+      c.uri,
+      (NULLIF(c.type, '') IS NOT NULL) DESC,
+      (NULLIF(c.image, '') IS NOT NULL) DESC,
+      (c.label IS NOT NULL) DESC,
+      (c.location IS NOT NULL) DESC,
+      (c.synonyms IS NOT NULL) DESC
+    ON CONFLICT (uri) DO UPDATE
+    SET
+      type = COALESCE(EXCLUDED.type, public.newsapi_concepts.type),
+      image = COALESCE(EXCLUDED.image, public.newsapi_concepts.image),
+      label = COALESCE(EXCLUDED.label, public.newsapi_concepts.label),
+      location = COALESCE(EXCLUDED.location, public.newsapi_concepts.location),
+      synonyms = COALESCE(EXCLUDED.synonyms, public.newsapi_concepts.synonyms),
+      updated_at = now()
+    `,
+  );
+
+  await db.query(
+    `
+    DELETE FROM public.newsapi_article_concepts ac
+    USING (
+      SELECT DISTINCT NULLIF(uri, '') AS article_uri
+      FROM tmp_newsapi_ai_load
+      WHERE NULLIF(uri, '') IS NOT NULL
+    ) t
+    WHERE ac.article_uri = t.article_uri
+    `,
+  );
+
+  await db.query(
+    `
+    INSERT INTO public.newsapi_article_concepts (
+      article_uri,
+      concept_uri
+    )
+    SELECT DISTINCT
+      NULLIF(t.uri, '') AS article_uri,
+      NULLIF(concept->>'uri', '') AS concept_uri
+    FROM tmp_newsapi_ai_load t
+    CROSS JOIN LATERAL jsonb_array_elements(
+      CASE
+        WHEN NULLIF(t.concepts, '') IS NOT NULL
+          AND NULLIF(t.concepts, '') <> 'null'
+          AND jsonb_typeof(NULLIF(t.concepts, '')::jsonb) = 'array'
+        THEN NULLIF(t.concepts, '')::jsonb
+        ELSE '[]'::jsonb
+      END
+    ) AS concept
+    WHERE NULLIF(t.uri, '') IS NOT NULL
+      AND concept ? 'uri'
+      AND NULLIF(concept->>'uri', '') IS NOT NULL
+    ON CONFLICT DO NOTHING
+    `,
+  );
+
+  await db.query(
+    `
+    INSERT INTO public.newsapi_categories (
+      uri,
+      parent_uri,
+      label
+    )
+    SELECT DISTINCT ON (c.uri)
+      c.uri,
+      c.parent_uri,
+      c.label
+    FROM (
+      SELECT
+        NULLIF(category->>'uri', '') AS uri,
+        NULLIF(category->>'parentUri', '') AS parent_uri,
+        NULLIF(category->>'label', '') AS label
+      FROM tmp_newsapi_ai_load t
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE
+          WHEN NULLIF(t.categories, '') IS NOT NULL
+            AND NULLIF(t.categories, '') <> 'null'
+            AND jsonb_typeof(NULLIF(t.categories, '')::jsonb) = 'array'
+          THEN NULLIF(t.categories, '')::jsonb
+          ELSE '[]'::jsonb
+        END
+      ) AS category
+      WHERE NULLIF(t.uri, '') IS NOT NULL
+        AND category ? 'uri'
+        AND NULLIF(category->>'uri', '') IS NOT NULL
+    ) c
+    ORDER BY
+      c.uri,
+      (NULLIF(c.parent_uri, '') IS NOT NULL) DESC,
+      (NULLIF(c.label, '') IS NOT NULL) DESC
+    ON CONFLICT (uri) DO UPDATE
+    SET
+      parent_uri = COALESCE(EXCLUDED.parent_uri, public.newsapi_categories.parent_uri),
+      label = COALESCE(EXCLUDED.label, public.newsapi_categories.label),
+      updated_at = now()
+    `,
+  );
+
+  await db.query(
+    `
+    DELETE FROM public.newsapi_article_categories ac
+    USING (
+      SELECT DISTINCT NULLIF(uri, '') AS article_uri
+      FROM tmp_newsapi_ai_load
+      WHERE NULLIF(uri, '') IS NOT NULL
+    ) t
+    WHERE ac.article_uri = t.article_uri
+    `,
+  );
+
+  await db.query(
+    `
+    INSERT INTO public.newsapi_article_categories (
+      article_uri,
+      category_uri
+    )
+    SELECT DISTINCT
+      NULLIF(t.uri, '') AS article_uri,
+      NULLIF(category->>'uri', '') AS category_uri
+    FROM tmp_newsapi_ai_load t
+    CROSS JOIN LATERAL jsonb_array_elements(
+      CASE
+        WHEN NULLIF(t.categories, '') IS NOT NULL
+          AND NULLIF(t.categories, '') <> 'null'
+          AND jsonb_typeof(NULLIF(t.categories, '')::jsonb) = 'array'
+        THEN NULLIF(t.categories, '')::jsonb
+        ELSE '[]'::jsonb
+      END
+    ) AS category
+    WHERE NULLIF(t.uri, '') IS NOT NULL
+      AND category ? 'uri'
+      AND NULLIF(category->>'uri', '') IS NOT NULL
+    ON CONFLICT DO NOTHING
+    `,
+  );
+}
+
+
 export const handler = async (event: S3Event, context: { awsRequestId?: string } = {}) => {
   const rec = event.Records?.[0];
   const requestId = context.awsRequestId ?? `manual-${Date.now()}`;
@@ -748,6 +1104,10 @@ export const handler = async (event: S3Event, context: { awsRequestId?: string }
         manifest.nth_run,
         manifest.collected_at,
       );
+    console.log("newsapi_articles_upsert_complete");
+
+    await syncNormalizedArticleDimensionsFromTemp(db);
+    console.log("normalized_article_dimensions_synced");
 
     const dbRowsUnchanged = rowsAttempted - rowsLoaded;
     const loadCompletedAtIso = new Date().toISOString();
@@ -758,6 +1118,15 @@ export const handler = async (event: S3Event, context: { awsRequestId?: string }
       dbRowsUpdated,
       dbRowsUnchanged,
     });
+
+    const pipelineRunMetrics = await upsertPipelineRunMetrics(
+      db,
+      manifest.run_id,
+      manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
+    );
+    console.log("pipeline_run_metrics:", pipelineRunMetrics);
 
     await setLoadCompleted(
       db,
@@ -795,6 +1164,7 @@ export const handler = async (event: S3Event, context: { awsRequestId?: string }
       max_date_time_published: diagnostics.maxDateTimePublished,
       sample_uris: diagnostics.sampleUris,
       populated_counts: diagnostics.populatedCounts,
+      pipeline_run_metrics: pipelineRunMetrics,
       load_completed_at: loadCompletedAtIso,
       duration_ms: Date.now() - startedMs,
       pipeline_status: "loaded",

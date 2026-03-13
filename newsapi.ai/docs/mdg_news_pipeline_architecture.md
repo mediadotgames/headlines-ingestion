@@ -2,37 +2,46 @@
 
 ## Overview
 
-The MDG News Pipeline ingests news articles from the EventRegistry / NewsAPI.ai platform, enriches them with structured metadata, and stores them in PostgreSQL for analysis, visualization, and clustering.
+The MDG News Pipeline ingests articles from EventRegistry / NewsAPI.ai, writes deterministic artifacts, and loads those artifacts into PostgreSQL for downstream analysis, clustering, and dashboarding.
 
-The system is designed to support:
+The design goals are:
 
-- Media coverage analysis
-- Event and story clustering
-- Topic trend analysis
-- Public-interest scoring
-- Coverage and omission detection across news outlets
+- reproducibility
+- auditability
+- deterministic replay
+- batch safety
+- analytical query performance
 
-The pipeline emphasizes **reproducibility**, **auditability**, and **artifact-based ingestion**.
+The warehouse keeps the raw upstream JSON payloads on article rows while also projecting selected dimensions into normalized relational tables.
 
 ---
 
 # System Architecture
 
-EventRegistry API ↓ Collector (Lambda or Local) ↓ Artifacts (S3 or Local Disk) ↓ Loader (Lambda or Local) ↓ PostgreSQL Warehouse
+```text
+EventRegistry API
+  ↓
+Collector (Lambda or Local)
+  ↓
+Artifacts (S3 or Local Disk)
+  ↓
+Loader (Lambda or Local)
+  ↓
+PostgreSQL Warehouse
+```
 
-The pipeline is intentionally split into **two stages**:
+The pipeline is intentionally split into two stages:
 
 | Stage | Purpose |
-|------|------|
-| Collector | Fetches articles and produces artifacts |
-| Loader | Loads artifacts into PostgreSQL |
+| --- | --- |
+| Collector | Fetches upstream data and produces immutable artifacts |
+| Loader | Validates artifacts and writes warehouse tables transactionally |
 
-This architecture enables:
-
+This split enables:
 - deterministic replays
-- debugging ingestion runs
+- backfills without re-calling the API
 - artifact inspection
-- backfilling historical data safely
+- cleaner operational debugging
 
 ---
 
@@ -40,20 +49,24 @@ This architecture enables:
 
 The collector performs the following tasks:
 
-1. Computes the ingestion window based on **Honolulu midnight**
+1. Computes the ingestion window
 2. Determines the logical `run_id`
-3. Reads the environment variable `RUN_TYPE`
+3. Reads `RUN_TYPE`
 4. Determines the next `nth_run`
-5. Inserts a row into `pipeline_runs`
-6. Fetches articles from EventRegistry
+5. Inserts a row into `public.pipeline_runs`
+6. Fetches articles from EventRegistry / NewsAPI.ai
 7. Deduplicates by `uri`
-8. Writes ingestion artifacts
+8. Writes artifacts
 
-Artifacts produced:
+Artifacts produced per run:
 
-articles.jsonl articles.csv manifest.json
+```text
+articles.jsonl
+articles.csv
+manifest.json
+```
 
-These artifacts form the **contract between collector and loader**.
+These artifacts form the contract between collector and loader.
 
 ---
 
@@ -61,66 +74,105 @@ These artifacts form the **contract between collector and loader**.
 
 The pipeline supports multiple executions for the same logical run window.
 
-Two fields define run identity:
+Two fields define run identity in addition to `run_id` and `ingestion_source`:
 
-run_type nth_run
+- `run_type`
+- `nth_run`
 
-### run_type
+## run_type
 
 Allowed values:
 
-scheduled backfill seed
+```text
+scheduled
+backfill
+seed
+```
 
-### nth_run
+## nth_run
 
 Represents the execution count for the same logical run.
 
 Example:
 
+```text
 run_id = 2026-03-09T10:00:00Z
 
-scheduled nth_run=1 scheduled nth_run=2 backfill nth_run=1
+scheduled / nth_run=1
+scheduled / nth_run=2
+backfill  / nth_run=1
+```
 
 ---
 
-# Pipeline Runs Table
+# Warehouse Tables
 
-Table:
+## 1. `public.pipeline_runs`
 
-public.pipeline_runs
+Tracks collector and loader lifecycle for each exact pipeline execution.
 
 Primary key:
 
+```sql
 (run_id, ingestion_source, run_type, nth_run)
+```
 
-Important columns:
+Important columns include:
 
-run_id ingestion_source run_type nth_run window_from window_to collected_at load_started_at load_completed_at rows_loaded db_rows_inserted db_rows_updated status
+```text
+run_id
+ingestion_source
+run_type
+nth_run
+window_from
+window_to
+collected_at
+load_started_at
+load_completed_at
+rows_loaded
+db_rows_inserted
+db_rows_updated
+status
+error_code
+error_message
+```
 
-This allows the system to:
+## 2. `public.newsapi_articles`
 
-- track retries
-- distinguish backfills
-- audit ingestion history
-- diagnose failures
-
----
-
-# Articles Table
-
-Primary table:
-
-public.newsapi_articles
+Primary fact table for ingested articles.
 
 Primary key:
 
+```sql
 uri
+```
 
-Important metadata columns:
+The article row stores:
 
-run_id ingestion_source run_type nth_run collected_at ingested_at
+- scalar article fields
+- run metadata
+- raw upstream JSONB payloads (`source`, `authors`, `categories`, `concepts`, etc.)
+- `source_uri`, which points to the canonical source dimension
 
-These fields allow every article row to be traced to the exact pipeline execution that produced or last updated it.
+## 3. `public.newsapi_sources`
+
+Canonical source dimension extracted from `newsapi_articles.source`.
+
+## 4. `public.newsapi_concepts`
+
+Canonical concept dimension extracted from `newsapi_articles.concepts`.
+
+## 5. `public.newsapi_article_concepts`
+
+Many-to-many bridge between articles and concepts.
+
+## 6. `public.newsapi_categories`
+
+Canonical category dimension extracted from `newsapi_articles.categories`.
+
+## 7. `public.newsapi_article_categories`
+
+Many-to-many bridge between articles and categories.
 
 ---
 
@@ -128,23 +180,55 @@ These fields allow every article row to be traced to the exact pipeline executio
 
 Current contract version:
 
+```text
 newsapi-ai/v3
+```
 
-This contract defines the shared schema between collector and loader.
+The artifact contract still carries the raw upstream fields as JSON strings in CSV / JSONL artifacts.
 
 Key metadata fields:
 
-run_id run_type nth_run ingestion_source collected_at
+```text
+run_id
+run_type
+nth_run
+ingestion_source
+collected_at
+```
 
 Core article fields include:
 
-uri url title body date_time date_time_published lang sentiment event_uri story_uri source authors
+```text
+uri
+url
+title
+body
+date_time
+date_time_published
+lang
+sentiment
+event_uri
+story_uri
+source
+authors
+```
 
 Enrichment fields include:
 
-categories concepts links videos shares duplicate_list extracted_dates location original_article raw_article
+```text
+categories
+concepts
+links
+videos
+shares
+duplicate_list
+extracted_dates
+location
+original_article
+raw_article
+```
 
-These fields are stored as JSON in artifacts and loaded into PostgreSQL JSONB columns.
+The collector does not need to emit separate normalized-dimension artifacts. The loader derives normalized tables from the same raw artifact payload.
 
 ---
 
@@ -152,18 +236,24 @@ These fields are stored as JSON in artifacts and loaded into PostgreSQL JSONB co
 
 Artifacts are written to deterministic paths.
 
-ingestion_source=newsapi-ai/ run_id=YYYY-MM-DDTHH-MM-SSZ/ run_type=scheduled|backfill|seed/ nth_run=N/ articles.jsonl articles.csv manifest.json load_report.json
-
-Example:
-
-s3://bucket/prefix/ ingestion_source=newsapi-ai/ run_id=2026-03-09T10-00-00Z/ run_type=scheduled/ nth_run=1/ manifest.json
+```text
+ingestion_source=newsapi-ai/
+  run_id=YYYY-MM-DDTHH-MM-SSZ/
+    run_type=scheduled|backfill|seed/
+      nth_run=N/
+        articles.jsonl
+        articles.csv
+        manifest.json
+        load_report.json
+        load_reports/<invocation>.json
+```
 
 Benefits:
 
-- prevents artifact overwrites
-- allows multiple executions
-- supports deterministic replay
-- enables debugging of individual runs
+- prevents accidental overwrite
+- supports multiple executions for the same logical run
+- preserves replayability
+- isolates run-level debugging
 
 ---
 
@@ -177,103 +267,124 @@ Loader responsibilities:
 2. Validate artifact contract version
 3. Validate CSV header
 4. Read `run_id`, `run_type`, and `nth_run`
-5. COPY CSV into a temporary staging table
-6. Perform transactional UPSERT into `newsapi_articles`
-7. Update the exact `pipeline_runs` row
-8. Produce `load_report.json`
+5. `COPY` CSV into a temporary staging table
+6. UPSERT `public.newsapi_articles`
+7. Sync normalized dimensions from the temporary staging table
+8. Update the exact `public.pipeline_runs` row
+9. Write `load_report.json`
 
 Loader guarantees:
 
 - transactional safety
-- idempotent loads
-- deterministic artifact replay
-- detailed ingestion diagnostics
+- idempotent artifact replay
+- advisory-lock protection against duplicate concurrent loads
+- deterministic article upserts
+- normalized-dimension synchronization from the same raw artifact payload
+
+---
+
+# Normalized Dimension Sync Model
+
+The loader keeps the raw JSONB payloads on `public.newsapi_articles`, but also projects selected dimensions into dedicated relational tables.
+
+## Source sync
+
+From staged article `source` JSON:
+
+- UPSERT `public.newsapi_sources`
+- set `public.newsapi_articles.source_uri`
+
+## Concept sync
+
+From staged article `concepts` JSON:
+
+- UPSERT canonical `public.newsapi_concepts`
+- replace article-level mappings in `public.newsapi_article_concepts`
+
+## Category sync
+
+From staged article `categories` JSON:
+
+- UPSERT canonical `public.newsapi_categories`
+- replace article-level mappings in `public.newsapi_article_categories`
+
+This design keeps article rows debuggable while making source, concept, and category queries much faster and cleaner.
+
+---
+
+# Why Keep JSONB and Normalized Tables Together
+
+Keeping both models is intentional.
+
+## Raw JSONB on articles provides:
+
+- exact upstream snapshot retention
+- debugging and auditability
+- compatibility with the artifact contract
+- flexibility for rarely queried fields
+
+## Normalized tables provide:
+
+- faster joins
+- simpler relational queries
+- easier indexing
+- better source/entity/category analytics
+
+This hybrid model is the current recommended warehouse design for the MDG news pipeline.
+
+---
+
+# Category Hierarchy Note
+
+`public.newsapi_categories.parent_uri` is stored as an upstream taxonomy reference string.
+
+It is not currently enforced as a self-referencing foreign key because the upstream taxonomy does not always materialize every ancestor node. The hierarchy can still be traversed logically using `parent_uri`, but the warehouse does not yet require a fully closed taxonomy tree.
 
 ---
 
 # Time Window Model
 
-The pipeline uses **Honolulu midnight** as the canonical boundary.
+The pipeline uses a canonical daily ingestion boundary and environment-controlled backfill windowing.
 
-This ensures the full U.S. news cycle is complete before ingestion runs.
+Important environment variables include:
 
-Example schedule:
+```text
+LOOKBACK_DAYS
+WINDOW_END_DAYS_AGO
+RUN_TYPE
+```
 
-00:05 Pacific/Honolulu
+These support:
 
-Environment variables:
-
-LOOKBACK_DAYS WINDOW_END_DAYS_AGO RUN_TYPE
-
-These variables allow:
-
-- historical backfills
+- scheduled daily ingestion
 - seed runs
-- scheduled ingestion
-
----
-
-# Enrichment Data Model
-
-Articles are enriched with structured metadata.
-
-## Concepts
-
-Concepts represent normalized entities such as:
-
-people organizations locations topics events
-
-Examples:
-
-Donald Trump Pentagon Artificial Intelligence United States Congress
-
-Concepts enable semantic clustering.
-
----
-
-## Categories
-
-Categories represent hierarchical topics.
-
-Examples:
-
-news/Politics news/Technology dmoz/Society/Law
-
-These enable topic-level aggregation.
-
----
-
-## Location
-
-Location metadata represents geographic context.
-
-Used for:
-
-- regional news coverage analysis
-- geographic clustering
-- international media comparison
+- controlled historical backfills
 
 ---
 
 # Clustering Foundations
 
-The enrichment data enables article clustering using signals such as:
+The warehouse supports downstream clustering and analysis using signals such as:
 
-shared concepts shared categories event_uri story_uri publication timestamps source relationships
+- article text and metadata
+- story / event identifiers
+- concepts
+- categories
+- location
+- source / outlet
+- timestamps
 
-Concept overlap is particularly useful for detecting stories covered by multiple outlets.
+The normalized concept and category tables are especially important for topic clustering, faceting, anomaly detection, and source-comparison analysis.
 
 ---
 
-# Future Extensions
+# Query Patterns Enabled by the Current Model
 
-Planned enhancements include:
+Examples now supported cleanly:
 
-- normalized concept tables
-- article similarity indexing
-- event-level clustering
-- public-interest scoring
-- media coverage heatmaps
-
-These capabilities build on the structured enrichment model already present in the pipeline.
-
+- recent articles by source domain
+- all articles linked to a concept URI
+- top categories by article count
+- source-level coverage comparisons
+- concept faceting across runs or windows
+- category-based clustering features
