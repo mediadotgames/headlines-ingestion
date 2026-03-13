@@ -18,7 +18,7 @@ import {
   isRetryableStatus,
   isRetryableError,
   backoffDelayMs,
-} from "../shared/retry";
+} from "../../shared/retry.ts";
 
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = (
