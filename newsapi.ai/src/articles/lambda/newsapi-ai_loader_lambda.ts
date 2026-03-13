@@ -86,6 +86,19 @@ async function s3PutJson(
   );
 }
 
+
+
+async function s3PutInvocationJson(
+  bucket: string,
+  runPrefix: string,
+  requestId: string,
+  obj: unknown,
+): Promise<string> {
+  const key = `${runPrefix}load_reports/${requestId}.json`;
+  await s3PutJson(bucket, key, obj);
+  return key;
+}
+
 async function setLoadStarted(
   db: Client,
   runId: string,
@@ -174,6 +187,64 @@ async function markRunFailed(
     `,
     [runId, ingestionSource, runType, nthRun, code, truncateErrorMessage(message)],
   );
+}
+
+
+
+type PipelineRunLoadState = {
+  status: string | null;
+  loadStartedAt: string | null;
+  loadCompletedAt: string | null;
+};
+
+async function tryAcquireRunLoadLock(
+  db: Client,
+  runId: string,
+  ingestionSource: string,
+  runType: string,
+  nthRun: number,
+): Promise<boolean> {
+  const lockNamespace = "newsapi-ai_loader";
+  const lockKey = `${runId}|${ingestionSource}|${runType}|${nthRun}`;
+
+  const res = await db.query(
+    `
+    SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired
+    `,
+    [lockNamespace, lockKey],
+  );
+
+  return Boolean(res.rows[0]?.acquired);
+}
+
+async function getPipelineRunLoadState(
+  db: Client,
+  runId: string,
+  ingestionSource: string,
+  runType: string,
+  nthRun: number,
+): Promise<PipelineRunLoadState> {
+  const res = await db.query(
+    `
+    SELECT
+      status,
+      load_started_at,
+      load_completed_at
+    FROM public.pipeline_runs
+    WHERE run_id = $1
+      AND ingestion_source = $2
+      AND run_type = $3
+      AND nth_run = $4
+    `,
+    [runId, ingestionSource, runType, nthRun],
+  );
+
+  const row = res.rows[0];
+  return {
+    status: row?.status ?? null,
+    loadStartedAt: row?.load_started_at ? new Date(row.load_started_at).toISOString() : null,
+    loadCompletedAt: row?.load_completed_at ? new Date(row.load_completed_at).toISOString() : null,
+  };
 }
 
 async function copyCsvIntoTempTable(db: Client, csvPath: string) {
@@ -512,8 +583,9 @@ async function bulkUpsertFromTemp(
   };
 }
 
-export const handler = async (event: S3Event) => {
+export const handler = async (event: S3Event, context: { awsRequestId?: string } = {}) => {
   const rec = event.Records?.[0];
+  const requestId = context.awsRequestId ?? `manual-${Date.now()}`;
   if (!rec) throw new Error("No S3 records in event");
 
   const bucket = rec.s3.bucket.name;
@@ -580,6 +652,73 @@ export const handler = async (event: S3Event) => {
   try {
     await db.query("BEGIN");
     console.log("transaction_started");
+
+    const lockAcquired = await tryAcquireRunLoadLock(
+      db,
+      manifest.run_id,
+      manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
+    );
+
+    if (!lockAcquired) {
+      const skippedAtIso = new Date().toISOString();
+      const skipReport = {
+        artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
+        ingestion_source: manifest.ingestion_source,
+        run_id: manifest.run_id,
+        run_type: manifest.run_type,
+        nth_run: manifest.nth_run,
+        s3_bucket: bucket,
+        s3_prefix: runPrefix,
+        load_started_at: loadStartedAtIso,
+        load_completed_at: skippedAtIso,
+        duration_ms: Date.now() - startedMs,
+        pipeline_status: "skipped_duplicate",
+        skip_reason: "duplicate_loader_execution_in_progress",
+        request_id: requestId,
+      };
+      await db.query("ROLLBACK");
+      console.log("transaction_rolled_back_duplicate");
+      const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, skipReport);
+      console.log("duplicate_invocation_report_written:", invocationReportKey);
+      console.log("loader_skipped_duplicate_execution");
+      return;
+    }
+
+    const existingState = await getPipelineRunLoadState(
+      db,
+      manifest.run_id,
+      manifest.ingestion_source,
+      manifest.run_type,
+      manifest.nth_run,
+    );
+
+    if (existingState.status === "loaded" && existingState.loadCompletedAt) {
+      const skippedAtIso = new Date().toISOString();
+      const skipReport = {
+        artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
+        ingestion_source: manifest.ingestion_source,
+        run_id: manifest.run_id,
+        run_type: manifest.run_type,
+        nth_run: manifest.nth_run,
+        s3_bucket: bucket,
+        s3_prefix: runPrefix,
+        load_started_at: loadStartedAtIso,
+        load_completed_at: skippedAtIso,
+        duration_ms: Date.now() - startedMs,
+        pipeline_status: "skipped_duplicate",
+        skip_reason: "pipeline_run_already_loaded",
+        existing_pipeline_run_state: existingState,
+        request_id: requestId,
+      };
+      await db.query("ROLLBACK");
+      console.log("transaction_rolled_back_already_loaded");
+      const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, skipReport);
+      console.log("duplicate_invocation_report_written:", invocationReportKey);
+      console.log("loader_skipped_already_loaded_run");
+      return;
+    }
 
     await setLoadStarted(
       db,
@@ -663,6 +802,12 @@ export const handler = async (event: S3Event) => {
 
     await s3PutJson(bucket, reportKey, loadReport);
     console.log("load_report_written:", reportKey);
+
+    const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, {
+      ...loadReport,
+      request_id: requestId,
+    });
+    console.log("invocation_report_written:", invocationReportKey);
     console.log("loader_completed_successfully");
   } catch (e: any) {
     console.error("loader_failed:", e);
