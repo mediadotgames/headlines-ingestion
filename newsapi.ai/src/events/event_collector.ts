@@ -41,6 +41,7 @@ const EVENT_STALE_AFTER_HOURS = Number(process.env.EVENT_STALE_AFTER_HOURS ?? "2
 const EVENT_DISCOVERY_MAX_ARTICLES = Number(process.env.EVENT_DISCOVERY_MAX_ARTICLES ?? "50000");
 const EVENT_DISCOVERY_MAX_EVENT_URIS = Number(process.env.EVENT_DISCOVERY_MAX_EVENT_URIS ?? "10000");
 const FETCH_MAX_ATTEMPTS = Number(process.env.FETCH_MAX_ATTEMPTS ?? "5");
+const EVENT_FETCH_BATCH_SIZE = Number(process.env.EVENT_FETCH_BATCH_SIZE ?? "50");
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
@@ -224,13 +225,6 @@ async function postEventRegistry(
 
       const json = (await res.json().catch(() => ({}))) as EventRegistryResponse;
 
-      console.log(`${contextLabel}: HTTP ${res.status}`);
-      console.log(`${contextLabel}: response keys:`, Object.keys(json ?? {}));
-      console.log(
-        `${contextLabel}: response preview:`,
-        JSON.stringify(json).slice(0, 800),
-      );
-
       if (!res.ok) {
         const message = `Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`;
         if (isRetryableStatus(res.status) && attempt < FETCH_MAX_ATTEMPTS) {
@@ -299,7 +293,6 @@ function normalizeKeyedEvent(uriKey: string, value: EventRegistryPayloadValue): 
 
 function extractEvents(payload: EventRegistryResponse): EventRegistryEvent[] {
   const keys = payload && typeof payload === "object" ? Object.keys(payload) : [];
-  console.log("extractEvents payload keys:", keys);
 
   if (payload.event) return [payload.event];
   if (Array.isArray(payload.events)) return payload.events;
@@ -316,7 +309,6 @@ function extractEvents(payload: EventRegistryResponse): EventRegistryEvent[] {
   }
 
   if (keyedEvents.length > 0) {
-    console.log("extractEvents: normalized keyed event payloads:", keyedEvents.length);
     return keyedEvents;
   }
 
@@ -483,50 +475,53 @@ async function main() {
     const selectedEventUris = freshnessFilteredRes.rows.map((r) => r.event_uri);
 
     console.log("distinct_event_uris_selected:", selectedEventUris.length);
-    console.log("sample selectedEventUris:", selectedEventUris.slice(0, 10));
 
     const byUri = new Map<string, EventRegistryEvent>();
 
-    for (let i = 0; i < selectedEventUris.length; i += 1) {
-      const eventUri = selectedEventUris[i];
+    const totalBatches = Math.ceil(selectedEventUris.length / EVENT_FETCH_BATCH_SIZE);
+    console.log(
+      `fetching ${selectedEventUris.length} events in ${totalBatches} batch(es) of up to ${EVENT_FETCH_BATCH_SIZE}`,
+    );
+
+    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx += 1) {
+      const batchStart = batchIdx * EVENT_FETCH_BATCH_SIZE;
+      const batchUris = selectedEventUris.slice(batchStart, batchStart + EVENT_FETCH_BATCH_SIZE);
+      const contextLabel = `batch ${batchIdx + 1}/${totalBatches}`;
+
       const payload = await postEventRegistry(
         {
           apiKey: EVENTREGISTRY_API_KEY,
-          eventUri,
+          eventUri: batchUris,
           includeEventConcepts: true,
           includeEventCategories: true,
           includeEventLocation: true,
           includeEventImages: true,
           includeEventStories: true,
         },
-        `event ${i + 1}/${selectedEventUris.length}`,
+        contextLabel,
       );
 
       const extracted = extractEvents(payload);
-
-      console.log(
-        `event ${i + 1}/${selectedEventUris.length}: selected uri=${eventUri}, extracted_count=${extracted.length}`,
-      );
-
-      if (extracted.length === 0) {
-        console.log(
-          `event ${i + 1}/${selectedEventUris.length}: no extracted events; payload preview=`,
-          JSON.stringify(payload).slice(0, 1000),
-        );
-      }
+      let batchMissingUri = 0;
 
       for (const event of extracted) {
         const uri = event.uri == null ? "" : String(event.uri).trim();
-
         if (!uri) {
-          console.log(
-            `event ${i + 1}/${selectedEventUris.length}: extracted object missing uri; preview=`,
-            JSON.stringify(event).slice(0, 500),
-          );
+          batchMissingUri += 1;
           continue;
         }
-
         byUri.set(uri, event);
+      }
+
+      console.log(
+        `${contextLabel}: requested=${batchUris.length} extracted=${extracted.length} missing_uri=${batchMissingUri} running_total=${byUri.size}`,
+      );
+
+      if (extracted.length === 0) {
+        console.warn(
+          `${contextLabel}: no events extracted; payload preview=`,
+          JSON.stringify(payload).slice(0, 500),
+        );
       }
     }
 

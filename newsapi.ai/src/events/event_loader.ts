@@ -586,6 +586,14 @@ async function main() {
     );
   }
 
+  console.log(
+    `run: ${manifest.run_id} | ${manifest.run_type} | nth_run=${manifest.nth_run} | collected_at=${manifest.collected_at}`,
+  );
+  console.log(
+    `parent: run_id=${manifest.parent_run_id ?? "none"} | ${manifest.parent_run_type ?? ""} | nth_run=${manifest.parent_nth_run ?? ""}`,
+  );
+  console.log(`events in manifest: ${manifest.events_fetched}`);
+
   const expectedHeader = csvHeader();
   const actualHeader = fs.readFileSync(csvPath, "utf8").split(/\r?\n/, 1)[0];
 
@@ -701,11 +709,16 @@ async function main() {
     const diagnostics = await collectArtifactDiagnostics(db);
     const { rowsInArtifact, rowsAttempted } = await countArtifactRows(db);
 
+    console.log(`rows in artifact: ${rowsInArtifact} total, ${rowsAttempted} with valid uri`);
+    console.log(`event date range: ${diagnostics.minEventDate ?? "n/a"} → ${diagnostics.maxEventDate ?? "n/a"}`);
+
     const { rowsLoaded, dbRowsInserted, dbRowsUpdated } =
       await bulkUpsertFromTemp(db);
 
     const dbRowsUnchanged = rowsAttempted - rowsLoaded;
     const loadCompletedAtIso = new Date().toISOString();
+
+    console.log(`upsert: inserted=${dbRowsInserted} updated=${dbRowsUpdated} unchanged=${dbRowsUnchanged}`);
 
     await upsertPipelineRunMetrics(
       db,
@@ -790,8 +803,10 @@ async function main() {
       loadReport,
       loadCompletedAtIso,
     );
-    console.log("Event load complete:", loadReportPath);
-    console.log("Invocation report:", invocationReportPath);
+    console.log(
+      `event load complete: ${rowsLoaded} upserted (${dbRowsInserted} inserted, ${dbRowsUpdated} updated, ${dbRowsUnchanged} unchanged) in ${Date.now() - startedMs}ms`,
+    );
+    console.log("load report:", loadReportPath);
   } catch (e: any) {
     console.error(e);
 
@@ -815,7 +830,7 @@ async function main() {
       console.error("Also failed to mark pipeline_runs as failed:", inner);
     }
 
-    process.exitCode = 1;
+    throw e;
   } finally {
     try {
       await db.query(`DROP TABLE IF EXISTS tmp_newsapi_events_load`);
@@ -829,4 +844,11 @@ async function main() {
 
 export async function handler() {
   await main();
+}
+
+if (require.main === module) {
+  handler().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
 }
