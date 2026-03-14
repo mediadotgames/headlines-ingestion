@@ -619,6 +619,32 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
   console.log("csv_key:", csvKey);
   console.log("report_key:", reportKey);
 
+  // ── Early exit if collector produced zero events ────────────────
+  if (manifest.events_fetched === 0) {
+    console.log("manifest reports 0 events fetched — nothing to load");
+    const emptyReport = {
+      pipeline_status: "skipped",
+      skip_reason: "zero_events_fetched",
+      run_id: manifest.run_id,
+      ingestion_source: manifest.ingestion_source,
+      run_type: manifest.run_type,
+      nth_run: manifest.nth_run,
+      parent_run_id: manifest.parent_run_id,
+      parent_run_type: manifest.parent_run_type,
+      parent_nth_run: manifest.parent_nth_run,
+      s3_bucket: bucket,
+      s3_prefix: runPrefix,
+      events_in_manifest: 0,
+      rows_loaded: 0,
+      db_rows_inserted: 0,
+      db_rows_updated: 0,
+    };
+    await s3PutJson(bucket, reportKey, emptyReport);
+    console.log("empty_load_report_written:", reportKey);
+    console.log("loader_completed_with_zero_events");
+    return;
+  }
+
   // ── Download CSV from S3 to /tmp ────────────────────────────────
   const csvPath = path.join("/tmp", EVENT_DATA_FILE);
   await s3DownloadToFile(bucket, csvKey, csvPath);
