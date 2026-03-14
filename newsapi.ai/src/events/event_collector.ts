@@ -41,7 +41,6 @@ const EVENT_STALE_AFTER_HOURS = Number(process.env.EVENT_STALE_AFTER_HOURS ?? "2
 const EVENT_DISCOVERY_MAX_ARTICLES = Number(process.env.EVENT_DISCOVERY_MAX_ARTICLES ?? "50000");
 const EVENT_DISCOVERY_MAX_EVENT_URIS = Number(process.env.EVENT_DISCOVERY_MAX_EVENT_URIS ?? "10000");
 const FETCH_MAX_ATTEMPTS = Number(process.env.FETCH_MAX_ATTEMPTS ?? "5");
-const EVENT_FETCH_BATCH_SIZE = Number(process.env.EVENT_FETCH_BATCH_SIZE ?? "50");
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
@@ -225,6 +224,13 @@ async function postEventRegistry(
 
       const json = (await res.json().catch(() => ({}))) as EventRegistryResponse;
 
+      console.log(`${contextLabel}: HTTP ${res.status}`);
+      console.log(`${contextLabel}: response keys:`, Object.keys(json ?? {}));
+      console.log(
+        `${contextLabel}: response preview:`,
+        JSON.stringify(json).slice(0, 800),
+      );
+
       if (!res.ok) {
         const message = `Event Registry HTTP ${res.status}: ${JSON.stringify(json)}`;
         if (isRetryableStatus(res.status) && attempt < FETCH_MAX_ATTEMPTS) {
@@ -293,6 +299,7 @@ function normalizeKeyedEvent(uriKey: string, value: EventRegistryPayloadValue): 
 
 function extractEvents(payload: EventRegistryResponse): EventRegistryEvent[] {
   const keys = payload && typeof payload === "object" ? Object.keys(payload) : [];
+  console.log("extractEvents payload keys:", keys);
 
   if (payload.event) return [payload.event];
   if (Array.isArray(payload.events)) return payload.events;
@@ -309,6 +316,7 @@ function extractEvents(payload: EventRegistryResponse): EventRegistryEvent[] {
   }
 
   if (keyedEvents.length > 0) {
+    console.log("extractEvents: normalized keyed event payloads:", keyedEvents.length);
     return keyedEvents;
   }
 
@@ -475,53 +483,50 @@ async function main() {
     const selectedEventUris = freshnessFilteredRes.rows.map((r) => r.event_uri);
 
     console.log("distinct_event_uris_selected:", selectedEventUris.length);
+    console.log("sample selectedEventUris:", selectedEventUris.slice(0, 10));
 
     const byUri = new Map<string, EventRegistryEvent>();
 
-    const totalBatches = Math.ceil(selectedEventUris.length / EVENT_FETCH_BATCH_SIZE);
-    console.log(
-      `fetching ${selectedEventUris.length} events in ${totalBatches} batch(es) of up to ${EVENT_FETCH_BATCH_SIZE}`,
-    );
-
-    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx += 1) {
-      const batchStart = batchIdx * EVENT_FETCH_BATCH_SIZE;
-      const batchUris = selectedEventUris.slice(batchStart, batchStart + EVENT_FETCH_BATCH_SIZE);
-      const contextLabel = `batch ${batchIdx + 1}/${totalBatches}`;
-
+    for (let i = 0; i < selectedEventUris.length; i += 1) {
+      const eventUri = selectedEventUris[i];
       const payload = await postEventRegistry(
         {
           apiKey: EVENTREGISTRY_API_KEY,
-          eventUri: batchUris,
+          eventUri,
           includeEventConcepts: true,
           includeEventCategories: true,
           includeEventLocation: true,
           includeEventImages: true,
           includeEventStories: true,
         },
-        contextLabel,
+        `event ${i + 1}/${selectedEventUris.length}`,
       );
 
       const extracted = extractEvents(payload);
-      let batchMissingUri = 0;
-
-      for (const event of extracted) {
-        const uri = event.uri == null ? "" : String(event.uri).trim();
-        if (!uri) {
-          batchMissingUri += 1;
-          continue;
-        }
-        byUri.set(uri, event);
-      }
 
       console.log(
-        `${contextLabel}: requested=${batchUris.length} extracted=${extracted.length} missing_uri=${batchMissingUri} running_total=${byUri.size}`,
+        `event ${i + 1}/${selectedEventUris.length}: selected uri=${eventUri}, extracted_count=${extracted.length}`,
       );
 
       if (extracted.length === 0) {
-        console.warn(
-          `${contextLabel}: no events extracted; payload preview=`,
-          JSON.stringify(payload).slice(0, 500),
+        console.log(
+          `event ${i + 1}/${selectedEventUris.length}: no extracted events; payload preview=`,
+          JSON.stringify(payload).slice(0, 1000),
         );
+      }
+
+      for (const event of extracted) {
+        const uri = event.uri == null ? "" : String(event.uri).trim();
+
+        if (!uri) {
+          console.log(
+            `event ${i + 1}/${selectedEventUris.length}: extracted object missing uri; preview=`,
+            JSON.stringify(event).slice(0, 500),
+          );
+          continue;
+        }
+
+        byUri.set(uri, event);
       }
     }
 
@@ -588,15 +593,15 @@ async function main() {
         event_date: e.eventDate ?? "",
         sentiment: e.sentiment == null ? "" : String(e.sentiment),
         social_score: e.socialScore == null ? "" : String(e.socialScore),
-        article_counts: JSON.stringify(e.articleCounts ?? null),
-        title: JSON.stringify(e.title ?? null),
-        summary: JSON.stringify(e.summary ?? null),
-        concepts: JSON.stringify(e.concepts ?? null),
-        categories: JSON.stringify(e.categories ?? null),
-        common_dates: JSON.stringify(e.commonDates ?? null),
-        location: JSON.stringify(e.location ?? null),
-        stories: JSON.stringify(e.stories ?? null),
-        images: JSON.stringify(e.images ?? null),
+        article_counts: e.articleCounts != null ? JSON.stringify(e.articleCounts) : "",
+        title: e.title != null ? JSON.stringify(e.title) : "",
+        summary: e.summary != null ? JSON.stringify(e.summary) : "",
+        concepts: e.concepts != null ? JSON.stringify(e.concepts) : "",
+        categories: e.categories != null ? JSON.stringify(e.categories) : "",
+        common_dates: e.commonDates != null ? JSON.stringify(e.commonDates) : "",
+        location: e.location != null ? JSON.stringify(e.location) : "",
+        stories: e.stories != null ? JSON.stringify(e.stories) : "",
+        images: e.images != null ? JSON.stringify(e.images) : "",
         wgt: e.wgt == null ? "" : String(e.wgt),
         raw_event: JSON.stringify(e),
       }),
