@@ -48,7 +48,9 @@ function parseS3RecordKey(rawKey: string): string {
 }
 
 async function s3GetText(bucket: string, key: string): Promise<string> {
-  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const resp = await s3.send(
+    new GetObjectCommand({ Bucket: bucket, Key: key }),
+  );
   if (!resp.Body) {
     throw new Error(`S3 GetObject returned empty body: s3://${bucket}/${key}`);
   }
@@ -60,7 +62,9 @@ async function s3DownloadToFile(
   key: string,
   destPath: string,
 ): Promise<void> {
-  const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const resp = await s3.send(
+    new GetObjectCommand({ Bucket: bucket, Key: key }),
+  );
   if (!resp.Body) {
     throw new Error(`S3 GetObject returned empty body: s3://${bucket}/${key}`);
   }
@@ -85,8 +89,6 @@ async function s3PutJson(
     }),
   );
 }
-
-
 
 async function s3PutInvocationJson(
   bucket: string,
@@ -231,6 +233,7 @@ async function upsertPipelineRunMetrics(
       ingestion_source,
       run_type,
       nth_run,
+      stage,
       metric_name,
       metric_value
     )
@@ -239,10 +242,11 @@ async function upsertPipelineRunMetrics(
       $2::text,
       $3::text,
       $4::integer,
+      'article_load'::text,
       metric_name,
       metric_value
     FROM metrics
-    ON CONFLICT (run_id, ingestion_source, run_type, nth_run, metric_name)
+    ON CONFLICT (run_id, ingestion_source, run_type, nth_run, stage, metric_name)
     DO UPDATE SET
       metric_value = EXCLUDED.metric_value
     RETURNING metric_name, metric_value
@@ -250,7 +254,10 @@ async function upsertPipelineRunMetrics(
     [runId, ingestionSource, runType, nthRun],
   );
 
-  return res.rows as Array<{ metric_name: string; metric_value: string | number }>;
+  return res.rows as Array<{
+    metric_name: string;
+    metric_value: string | number;
+  }>;
 }
 
 async function markRunFailed(
@@ -275,11 +282,16 @@ async function markRunFailed(
       AND run_type = $3
       AND nth_run = $4
     `,
-    [runId, ingestionSource, runType, nthRun, code, truncateErrorMessage(message)],
+    [
+      runId,
+      ingestionSource,
+      runType,
+      nthRun,
+      code,
+      truncateErrorMessage(message),
+    ],
   );
 }
-
-
 
 type PipelineRunLoadState = {
   status: string | null;
@@ -332,8 +344,12 @@ async function getPipelineRunLoadState(
   const row = res.rows[0];
   return {
     status: row?.status ?? null,
-    loadStartedAt: row?.load_started_at ? new Date(row.load_started_at).toISOString() : null,
-    loadCompletedAt: row?.load_completed_at ? new Date(row.load_completed_at).toISOString() : null,
+    loadStartedAt: row?.load_started_at
+      ? new Date(row.load_started_at).toISOString()
+      : null,
+    loadCompletedAt: row?.load_completed_at
+      ? new Date(row.load_completed_at).toISOString()
+      : null,
   };
 }
 
@@ -435,7 +451,9 @@ async function countArtifactRows(db: Client) {
   };
 }
 
-async function getArtifactDiagnostics(db: Client): Promise<ArtifactDiagnostics> {
+async function getArtifactDiagnostics(
+  db: Client,
+): Promise<ArtifactDiagnostics> {
   const summaryRes = await db.query(`
     SELECT
       COUNT(*)::int AS rows_in_artifact,
@@ -672,7 +690,6 @@ async function bulkUpsertFromTemp(
     dbRowsUpdated: Number(res.rows[0].db_rows_updated),
   };
 }
-
 
 async function syncNormalizedArticleDimensionsFromTemp(db: Client) {
   await db.query(
@@ -938,8 +955,10 @@ async function syncNormalizedArticleDimensionsFromTemp(db: Client) {
   );
 }
 
-
-export const handler = async (event: S3Event, context: { awsRequestId?: string } = {}) => {
+export const handler = async (
+  event: S3Event,
+  context: { awsRequestId?: string } = {},
+) => {
   const rec = event.Records?.[0];
   const requestId = context.awsRequestId ?? `manual-${Date.now()}`;
   if (!rec) throw new Error("No S3 records in event");
@@ -1036,7 +1055,12 @@ export const handler = async (event: S3Event, context: { awsRequestId?: string }
       };
       await db.query("ROLLBACK");
       console.log("transaction_rolled_back_duplicate");
-      const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, skipReport);
+      const invocationReportKey = await s3PutInvocationJson(
+        bucket,
+        runPrefix,
+        requestId,
+        skipReport,
+      );
       console.log("duplicate_invocation_report_written:", invocationReportKey);
       console.log("loader_skipped_duplicate_execution");
       return;
@@ -1070,7 +1094,12 @@ export const handler = async (event: S3Event, context: { awsRequestId?: string }
       };
       await db.query("ROLLBACK");
       console.log("transaction_rolled_back_already_loaded");
-      const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, skipReport);
+      const invocationReportKey = await s3PutInvocationJson(
+        bucket,
+        runPrefix,
+        requestId,
+        skipReport,
+      );
       console.log("duplicate_invocation_report_written:", invocationReportKey);
       console.log("loader_skipped_already_loaded_run");
       return;
@@ -1173,10 +1202,15 @@ export const handler = async (event: S3Event, context: { awsRequestId?: string }
     await s3PutJson(bucket, reportKey, loadReport);
     console.log("load_report_written:", reportKey);
 
-    const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, {
-      ...loadReport,
-      request_id: requestId,
-    });
+    const invocationReportKey = await s3PutInvocationJson(
+      bucket,
+      runPrefix,
+      requestId,
+      {
+        ...loadReport,
+        request_id: requestId,
+      },
+    );
     console.log("invocation_report_written:", invocationReportKey);
     console.log("loader_completed_successfully");
   } catch (e: any) {
