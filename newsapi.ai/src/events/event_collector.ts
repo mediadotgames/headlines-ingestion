@@ -457,9 +457,9 @@ async function main() {
       LEFT JOIN public.events e
         ON e.uri = a.event_uri
       WHERE (
-        ($2::boolean = true AND e.uri IS NULL)
+        e.uri IS NULL
         OR
-        ($3::boolean = true AND e.uri IS NOT NULL AND e.last_collected_at < NOW() - ($4::text || ' hours')::interval)
+        ($3::boolean = true AND e.last_collected_at < NOW() - ($4::text || ' hours')::interval)
         OR
         ($2::boolean = false AND $3::boolean = false)
       )

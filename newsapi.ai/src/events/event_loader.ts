@@ -594,6 +594,12 @@ async function main() {
   );
   console.log(`events in manifest: ${manifest.events_fetched}`);
 
+  if (manifest.events_fetched === 0) {
+    console.log("manifest reports 0 events fetched — nothing to load");
+    console.log("loader_completed_with_zero_events");
+    return;
+  }
+
   const expectedHeader = csvHeader();
   const actualHeader = fs.readFileSync(csvPath, "utf8").split(/\r?\n/, 1)[0];
 

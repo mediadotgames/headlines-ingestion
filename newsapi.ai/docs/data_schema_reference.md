@@ -249,6 +249,105 @@ Tracks the lifecycle of ingestion runs.
 
 ---
 
+# Table: public.events
+
+Canonical event dimension populated by the event ingestion pipeline. Each row represents one upstream EventRegistry event, identified by its event URI.
+
+## Primary Key
+
+```sql
+uri text primary key
+```
+
+## Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| uri | text | not null | | Stable upstream event identifier |
+| total_article_count | integer | | | Total articles associated with the event upstream |
+| relevance | integer | | | Upstream relevance score |
+| event_date | date | | | Date the event occurred |
+| sentiment | double precision | | | Upstream sentiment score |
+| social_score | double precision | | | Upstream social media score |
+| article_counts | jsonb | | | Per-language article count breakdown |
+| title | jsonb | | | Localized event titles |
+| summary | jsonb | | | Localized event summaries |
+| concepts | jsonb | | | Concepts associated with the event |
+| categories | jsonb | | | Categories associated with the event |
+| common_dates | jsonb | | | Frequently mentioned dates in the event |
+| location | jsonb | | | Geographic location of the event |
+| stories | jsonb | | | Story clusters within the event |
+| images | jsonb | | | Images associated with the event |
+| wgt | bigint | | | Upstream weight |
+| raw_event | jsonb | not null | | Full original EventRegistry event payload |
+| first_collected_at | timestamptz | not null | `now()` | First time this event was fetched |
+| last_collected_at | timestamptz | not null | `now()` | Most recent time this event was fetched |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+| updated_at | timestamptz | not null | `now()` | Row update timestamp |
+
+## Indexes
+
+| Name | Definition |
+| --- | --- |
+| `events_pkey` | PRIMARY KEY btree (`uri`) |
+| `idx_events_event_date` | btree (`event_date` DESC) |
+| `idx_events_last_collected_at` | btree (`last_collected_at` DESC) |
+| `idx_events_relevance` | btree (`relevance` DESC) |
+| `idx_events_social_score` | btree (`social_score` DESC) |
+| `idx_events_total_article_count` | btree (`total_article_count` DESC) |
+
+## Triggers
+
+- `set_updated_at` — BEFORE UPDATE, executes `tg_set_updated_at()`
+
+## Relationships
+
+- many events ↔ many `public.newsapi_articles` via `newsapi_articles.event_uri = events.uri`
+
+---
+
+# Table: public.pipeline_run_metrics
+
+Per-stage metrics for pipeline runs. Each row is one metric measurement for a specific pipeline stage within a run.
+
+## Primary Key
+
+```sql
+(run_id, ingestion_source, run_type, nth_run, stage, metric_name)
+```
+
+## Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| run_id | timestamptz | not null | | Logical ingestion run identifier |
+| ingestion_source | text | not null | | Pipeline source name |
+| run_type | text | not null | | Execution mode (`scheduled`, `backfill`, `seed`) |
+| nth_run | integer | not null | | Retry / execution ordinal |
+| stage | text | not null | `'article_load'` | Pipeline stage that produced the metric |
+| metric_name | text | not null | | Name of the metric |
+| metric_value | bigint | not null | | Numeric value of the metric |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+
+## Indexes
+
+| Name | Definition |
+| --- | --- |
+| `pipeline_run_metrics_pkey` | PRIMARY KEY btree (`run_id`, `ingestion_source`, `run_type`, `nth_run`, `stage`, `metric_name`) |
+| `idx_pipeline_run_metrics_metric_name` | btree (`metric_name`) |
+| `idx_pipeline_run_metrics_run_lookup` | btree (`run_id` DESC, `ingestion_source`, `run_type`, `nth_run`, `stage`) |
+| `idx_pipeline_run_metrics_stage_metric` | btree (`stage`, `metric_name`) |
+
+## Check Constraints
+
+| Name | Expression |
+| --- | --- |
+| `pipeline_run_metrics_nth_run_check` | `nth_run >= 1` |
+| `pipeline_run_metrics_run_type_check` | `run_type IN ('scheduled', 'backfill', 'seed')` |
+| `pipeline_run_metrics_stage_check` | `stage IN ('article_collect', 'article_load', 'event_collect', 'event_load')` |
+
+---
+
 # Key Relationships
 
 ```text
@@ -256,11 +355,15 @@ pipeline_runs
       ↓
 newsapi_articles
       ├── source_uri → newsapi_sources
+      ├── event_uri → events
       ├── article_concepts → newsapi_concepts
       └── article_categories → newsapi_categories
+
+pipeline_run_metrics
+      └── (run_id, ingestion_source, run_type, nth_run) → pipeline_runs
 ```
 
-Each pipeline run produces many article rows. Articles retain the raw JSONB enrichment payloads while also syncing the canonical source, concept, and category dimensions.
+Each pipeline run produces many article rows. Articles retain the raw JSONB enrichment payloads while also syncing the canonical source, concept, and category dimensions. The event pipeline discovers event URIs from loaded articles and populates the `events` table. Pipeline run metrics track per-stage measurements across both the article and event pipelines.
 
 ---
 

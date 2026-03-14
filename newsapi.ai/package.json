@@ -17,7 +17,17 @@
     "zip:lambda:loader:events": "node scripts/zip-lambda.js dist/events/lambda/event-loader_lambda.js dist/events/lambda/event-loader_lambda.zip",
     "package:lambda:collector:events": "npm run build:lambda:collector:events && npm run zip:lambda:collector:events",
     "package:lambda:loader:events": "npm run build:lambda:loader:events && npm run zip:lambda:loader:events",
-    "package:lambdas": "npm run package:lambda:collector:newsapi-ai && npm run package:lambda:loader:newsapi-ai && npm run package:lambda:collector:events && npm run package:lambda:loader:events"
+    "package:lambdas": "npm run package:lambda:collector:newsapi-ai && npm run package:lambda:loader:newsapi-ai && npm run package:lambda:collector:events && npm run package:lambda:loader:events",
+    "deploy:lambda:collector:newsapi-ai": "aws lambda update-function-code --function-name newsapi-ai_collector --zip-file fileb://dist/articles/lambda/newsapi-ai-collector_lambda.zip",
+    "deploy:lambda:loader:newsapi-ai": "aws lambda update-function-code --function-name newsapi-ai_loader --zip-file fileb://dist/articles/lambda/newsapi-ai-loader_lambda.zip",
+    "deploy:lambda:collector:events": "aws lambda update-function-code --function-name event_collector --zip-file fileb://dist/events/lambda/event-collector_lambda.zip",
+    "deploy:lambda:loader:events": "aws lambda update-function-code --function-name event-loader --zip-file fileb://dist/events/lambda/event-loader_lambda.zip",
+    "deploy:lambdas": "npm run deploy:lambda:collector:newsapi-ai && npm run deploy:lambda:loader:newsapi-ai && npm run deploy:lambda:collector:events && npm run deploy:lambda:loader:events",
+    "ship:lambda:collector:newsapi-ai": "npm run package:lambda:collector:newsapi-ai && npm run deploy:lambda:collector:newsapi-ai",
+    "ship:lambda:loader:newsapi-ai": "npm run package:lambda:loader:newsapi-ai && npm run deploy:lambda:loader:newsapi-ai",
+    "ship:lambda:collector:events": "npm run package:lambda:collector:events && npm run deploy:lambda:collector:events",
+    "ship:lambda:loader:events": "npm run package:lambda:loader:events && npm run deploy:lambda:loader:events",
+    "ship:lambdas": "npm run package:lambdas && npm run deploy:lambdas"
   },
   "keywords": [],
   "author": "",
