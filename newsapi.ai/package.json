@@ -11,7 +11,13 @@
     "zip:lambda:loader:newsapi-ai": "node scripts/zip-lambda.js dist/articles/lambda/newsapi-ai-loader_lambda.js dist/articles/lambda/newsapi-ai-loader_lambda.zip",
     "package:lambda:collector:newsapi-ai": "npm run build:lambda:collector:newsapi-ai && npm run zip:lambda:collector:newsapi-ai",
     "package:lambda:loader:newsapi-ai": "npm run build:lambda:loader:newsapi-ai && npm run zip:lambda:loader:newsapi-ai",
-    "package:lambdas": "npm run package:lambda:collector:newsapi-ai && npm run package:lambda:loader:newsapi-ai"
+    "build:lambda:collector:events": "esbuild src/events/lambda/event_collector_lambda.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/events/lambda/event-collector_lambda.js",
+    "build:lambda:loader:events": "esbuild src/events/lambda/event_loader_lambda.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/events/lambda/event-loader_lambda.js",
+    "zip:lambda:collector:events": "node scripts/zip-lambda.js dist/events/lambda/event-collector_lambda.js dist/events/lambda/event-collector_lambda.zip",
+    "zip:lambda:loader:events": "node scripts/zip-lambda.js dist/events/lambda/event-loader_lambda.js dist/events/lambda/event-loader_lambda.zip",
+    "package:lambda:collector:events": "npm run build:lambda:collector:events && npm run zip:lambda:collector:events",
+    "package:lambda:loader:events": "npm run build:lambda:loader:events && npm run zip:lambda:loader:events",
+    "package:lambdas": "npm run package:lambda:collector:newsapi-ai && npm run package:lambda:loader:newsapi-ai && npm run package:lambda:collector:events && npm run package:lambda:loader:events"
   },
   "keywords": [],
   "author": "",
