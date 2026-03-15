@@ -173,26 +173,36 @@ cleanup() {
 # Pipeline Polling
 # ──────────────────────────────────────────────────────────────────────
 
-# Poll S3 for the presence of load_report.json in the run prefix.
-# Since nth_run is auto-assigned, we need to find the run prefix first.
-# We know: ARTIFACT_PREFIX/ingestion_source=newsapi-ai/run_id=<safe_run_id>/run_type=backfill/
-# And safe_run_id = run_id with colons replaced by hyphens.
+# Find the current highest nth_run under a run_id/run_type prefix.
+# Returns the number (e.g. "6"), or "0" if none exist yet.
+get_max_nth_run() {
+  local artifact_bucket="$1"
+  local s3_prefix="$2"
+
+  # List immediate "folders" under the prefix and extract nth_run values
+  aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" 2>/dev/null \
+    | grep -oP 'nth_run=\K[0-9]+' \
+    | sort -n \
+    | tail -1 || echo "0"
+}
+
+# Poll S3 for load_report.json in a specific nth_run folder.
+# We pass the expected nth_run so we don't match artifacts from previous runs.
 poll_for_article_load_report() {
   local artifact_bucket="$1"
   local artifact_prefix="$2"
   local safe_run_id="$3"
+  local expected_nth_run="$4"
 
-  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai/run_id=${safe_run_id}/run_type=backfill/"
+  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai/run_id=${safe_run_id}/run_type=backfill/nth_run=${expected_nth_run}/"
 
   local elapsed=0
   while (( elapsed < POLL_TIMEOUT_SECONDS )); do
-    # List objects under the prefix and look for load_report.json
     local found
     found="$(aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" --recursive 2>/dev/null \
       | grep 'load_report\.json$' || true)"
 
     if [[ -n "$found" ]]; then
-      # Extract the full key
       local key
       key="$(echo "$found" | awk '{print $NF}' | head -1)"
       echo "$key"
@@ -201,7 +211,7 @@ poll_for_article_load_report() {
 
     sleep "$POLL_INTERVAL_SECONDS"
     elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
-    log "  Polling article load_report... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
+    log "  Polling article load_report (nth_run=${expected_nth_run})... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
   done
 
   log "  TIMEOUT waiting for article load_report.json" >&2
@@ -213,10 +223,11 @@ poll_for_event_completion() {
   local artifact_bucket="$1"
   local artifact_prefix="$2"
   local safe_run_id="$3"
+  local expected_nth_run="$4"
 
   # Event artifacts go under:
-  # ARTIFACT_PREFIX/ingestion_source=newsapi-ai-events/parent_run_id=<safe_run_id>/parent_run_type=backfill/
-  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/"
+  # ARTIFACT_PREFIX/ingestion_source=newsapi-ai-events/parent_run_id=<safe_run_id>/parent_run_type=backfill/nth_run=<N>/
+  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/nth_run=${expected_nth_run}/"
 
   local elapsed=0
   while (( elapsed < POLL_TIMEOUT_SECONDS )); do
@@ -239,7 +250,7 @@ poll_for_event_completion() {
 
     sleep "$POLL_INTERVAL_SECONDS"
     elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
-    log "  Polling event completion... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
+    log "  Polling event completion (nth_run=${expected_nth_run})... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
   done
 
   log "  TIMEOUT waiting for event pipeline completion" >&2
@@ -470,7 +481,14 @@ ENVJSON
 )"
       log "Event collector configured"
 
-      # 4. Invoke article collector
+      # 4. Snapshot current max nth_run so we can poll for the new one
+      local run_type_prefix="${ARTIFACT_PREFIX}/ingestion_source=newsapi-ai/run_id=${safe_run_id}/run_type=backfill/"
+      local max_nth_run
+      max_nth_run="$(get_max_nth_run "$ARTIFACT_BUCKET" "$run_type_prefix")"
+      local expected_nth_run=$(( max_nth_run + 1 ))
+      log "Current max nth_run=$max_nth_run, expecting nth_run=$expected_nth_run"
+
+      # 5. Invoke article collector
       log "Invoking $ARTICLE_COLLECTOR_FN..."
       local invoke_response="/tmp/backfill_invoke_${current_date}.json"
       local invoke_result
@@ -496,19 +514,19 @@ ENVJSON
       else
         log "Article collector invoked successfully"
 
-        # 5. Poll for article load_report.json
-        log "Polling for article load_report.json..."
+        # 6. Poll for article load_report.json in the new nth_run
+        log "Polling for article load_report.json (nth_run=${expected_nth_run})..."
         local load_report_key=""
         load_report_key="$(poll_for_article_load_report \
-          "$ARTIFACT_BUCKET" "$ARTIFACT_PREFIX" "$safe_run_id")" || true
+          "$ARTIFACT_BUCKET" "$ARTIFACT_PREFIX" "$safe_run_id" "$expected_nth_run")" || true
 
         if [[ -n "$load_report_key" ]]; then
           log "Article load_report found: $load_report_key"
 
-          # 6. Poll for event pipeline completion
+          # 7. Poll for event pipeline completion
           log "Polling for event pipeline completion..."
           poll_for_event_completion \
-            "$ARTIFACT_BUCKET" "$ARTIFACT_PREFIX" "$safe_run_id" || true
+            "$ARTIFACT_BUCKET" "$ARTIFACT_PREFIX" "$safe_run_id" "$expected_nth_run" || true
         else
           log "WARNING: Article load_report not found within timeout"
         fi
