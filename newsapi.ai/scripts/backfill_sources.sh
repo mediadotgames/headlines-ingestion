@@ -122,7 +122,7 @@ wait_for_lambda_ready() {
         log "ERROR: Lambda update failed for $fn"
         return 1 ;;
     esac
-    (( attempt++ ))
+    attempt=$(( attempt + 1 ))
     sleep 2
   done
   log "ERROR: Timed out waiting for $fn update (${max_attempts}×2s)"
