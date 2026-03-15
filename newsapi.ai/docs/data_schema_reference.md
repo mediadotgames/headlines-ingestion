@@ -965,9 +965,43 @@ url text primary key
 
 ## Table: public.topic_assignment_audit
 
-Audit trail for topic assignment changes. Details TBD — table exists in live DB but is not yet fully documented.
+Audit trail for topic assignment decisions. Each row records one assignment action (assign, reassign, remove) with the scoring signals that drove it.
 
-> **TODO**: Capture column definitions from live DB.
+### Primary Key
+
+```sql
+id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| id | uuid | not null | `gen_random_uuid()` | Unique audit record identifier |
+| story_id | text | not null | | Story URI that was assigned |
+| topic_id | uuid | not null | | Topic cluster involved |
+| assigned_at | timestamptz | not null | `now()` | When the assignment action occurred |
+| method | text | not null | | Algorithm used (e.g. `cosine`, `composite`) |
+| similarity_to_centroid | real | | | Cosine similarity to topic centroid |
+| threshold_used | real | | | Similarity threshold applied for this decision |
+| action | text | not null | | Action taken (`assign`, `reassign`, `remove`) |
+| pipeline_run_id | uuid | | | FK to enrichment pipeline run |
+| embedding_similarity | real | | | Raw embedding similarity score |
+| concept_overlap_score | real | | | Fraction of shared concepts between story and topic |
+| category_match | boolean | | | Whether story's top_category matches topic's dominant_category |
+| temporal_distance_hours | real | | | Hours between story publish time and topic centroid time |
+| composite_score | real | | | Weighted combination of all signals |
+| composite_threshold | real | | | Threshold applied to composite_score |
+| signal_weights | jsonb | | | Weights used for each signal in composite scoring |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `topic_assignment_audit_pkey` | PRIMARY KEY btree (`id`) |
+| `idx_taa_assigned_at` | btree (`assigned_at` DESC) |
+| `idx_taa_story_id` | btree (`story_id`) |
+| `idx_taa_topic_id` | btree (`topic_id`) |
 
 ---
 
