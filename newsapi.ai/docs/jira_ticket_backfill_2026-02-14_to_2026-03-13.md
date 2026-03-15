@@ -57,7 +57,10 @@ A bash script that uses the AWS CLI to:
    - Invoke the article collector; the S3-triggered daisy chain handles the rest:
      article loader → event collector → event loader
    - Poll S3 for `event-load-report.json` to confirm pipeline completion
-   - Log results and advance to the next date
+   - Display a results summary (article/event counts, errors)
+   - **Pause for operator review** — the script blocks until the operator
+     approves (`y`), retries the date (`r`), skips (`s`), or quits (`q`)
+   - Only advances to the next date after explicit approval
 3. After all 28 days complete:
    - Update `EVENTREGISTRY_SOURCE_URIS` to all 25 sources
    - Restore `EVENT_DISCOVERY_SCOPE=parent_run` (production default)
@@ -67,6 +70,8 @@ A bash script that uses the AWS CLI to:
 
 - **No code changes required** — uses existing env var knobs on the Lambdas
 - **Sequential execution** — one date at a time, no parallelism
+- **Operator review gate** — script pauses after each date for manual validation
+  before proceeding (approve / retry / skip / quit)
 - **`time_window` event discovery** — scans all articles in each day's window
   regardless of source, catching missing events from the original corpus
 - **`EVENT_DISCOVERY_ONLY_MISSING=true`** — skips events already in the DB
