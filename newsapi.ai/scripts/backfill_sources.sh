@@ -218,39 +218,74 @@ poll_for_article_load_report() {
   return 1
 }
 
-# Poll for event-load-report or event loader load_reports/ directory
+# Snapshot existing collected_at= folders under an event parent_nth_run prefix.
+# Returns one folder name per line (e.g. "collected_at=2026-03-15T04-10-42.618Z/").
+snapshot_event_collected_at() {
+  local artifact_bucket="$1"
+  local s3_prefix="$2"
+
+  aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" 2>/dev/null \
+    | grep -oP 'collected_at=[^ /]+/' || true
+}
+
+# Poll for event pipeline completion by watching for a NEW collected_at= folder
+# that wasn't present before the Lambda was invoked.
 poll_for_event_completion() {
   local artifact_bucket="$1"
   local artifact_prefix="$2"
   local safe_run_id="$3"
   local expected_nth_run="$4"
+  local prior_collected_at="$5"  # newline-separated list of pre-existing collected_at= folders
 
   # Event artifacts go under:
-  # ARTIFACT_PREFIX/ingestion_source=newsapi-ai-events/parent_run_id=<safe_run_id>/parent_run_type=backfill/nth_run=<N>/
-  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/nth_run=${expected_nth_run}/"
+  # ARTIFACT_PREFIX/ingestion_source=newsapi-ai-events/parent_run_id=<safe_run_id>/parent_run_type=backfill/parent_nth_run=<N>/collected_at=<ts>/
+  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/parent_nth_run=${expected_nth_run}/"
 
   local elapsed=0
   while (( elapsed < POLL_TIMEOUT_SECONDS )); do
-    # Look for event-manifest.json first (means event collector ran)
-    local event_manifest
-    event_manifest="$(aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" --recursive 2>/dev/null \
-      | grep 'event-manifest\.json$' || true)"
+    # List collected_at= folders and find any new ones
+    local current_folders
+    current_folders="$(aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" 2>/dev/null \
+      | grep -oP 'collected_at=[^ /]+/' || true)"
 
-    if [[ -n "$event_manifest" ]]; then
-      # Now look for load_reports/ (event loader output)
-      local event_load_report
-      event_load_report="$(aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" --recursive 2>/dev/null \
-        | grep 'load_reports/' || true)"
+    # Find new folders not in the prior snapshot
+    local new_folder=""
+    if [[ -n "$current_folders" ]]; then
+      while IFS= read -r folder; do
+        if ! echo "$prior_collected_at" | grep -qF "$folder"; then
+          new_folder="$folder"
+          break
+        fi
+      done <<< "$current_folders"
+    fi
 
-      if [[ -n "$event_load_report" ]]; then
-        log "  Event pipeline complete" >&2
-        return 0
+    if [[ -n "$new_folder" ]]; then
+      local new_prefix="${s3_prefix}${new_folder}"
+      log "  New event folder: $new_folder" >&2
+
+      # Check for event-manifest.json (event collector done)
+      local event_manifest
+      event_manifest="$(aws s3 ls "s3://${artifact_bucket}/${new_prefix}" 2>/dev/null \
+        | grep 'event-manifest\.json' || true)"
+
+      if [[ -n "$event_manifest" ]]; then
+        # Check for load_reports/ (event loader done)
+        local event_load_report
+        event_load_report="$(aws s3 ls "s3://${artifact_bucket}/${new_prefix}" 2>/dev/null \
+          | grep 'load_reports/' || true)"
+
+        if [[ -n "$event_load_report" ]]; then
+          log "  Event pipeline complete" >&2
+          return 0
+        else
+          log "  Event manifest found, waiting for load_reports/..." >&2
+        fi
       fi
     fi
 
     sleep "$POLL_INTERVAL_SECONDS"
     elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
-    log "  Polling event completion (nth_run=${expected_nth_run})... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
+    log "  Polling event completion (parent_nth_run=${expected_nth_run})... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
   done
 
   log "  TIMEOUT waiting for event pipeline completion" >&2
@@ -481,12 +516,17 @@ ENVJSON
 )"
       log "Event collector configured"
 
-      # 4. Snapshot current max nth_run so we can poll for the new one
+      # 4. Snapshot current state so we can poll for new artifacts
       local run_type_prefix="${ARTIFACT_PREFIX}/ingestion_source=newsapi-ai/run_id=${safe_run_id}/run_type=backfill/"
       local max_nth_run
       max_nth_run="$(get_max_nth_run "$ARTIFACT_BUCKET" "$run_type_prefix")"
       local expected_nth_run=$(( max_nth_run + 1 ))
       log "Current max nth_run=$max_nth_run, expecting nth_run=$expected_nth_run"
+
+      # Snapshot existing event collected_at= folders for the expected parent_nth_run
+      local event_parent_prefix="${ARTIFACT_PREFIX}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/parent_nth_run=${expected_nth_run}/"
+      local prior_collected_at
+      prior_collected_at="$(snapshot_event_collected_at "$ARTIFACT_BUCKET" "$event_parent_prefix")"
 
       # 5. Invoke article collector
       log "Invoking $ARTICLE_COLLECTOR_FN..."
@@ -526,7 +566,8 @@ ENVJSON
           # 7. Poll for event pipeline completion
           log "Polling for event pipeline completion..."
           poll_for_event_completion \
-            "$ARTIFACT_BUCKET" "$ARTIFACT_PREFIX" "$safe_run_id" "$expected_nth_run" || true
+            "$ARTIFACT_BUCKET" "$ARTIFACT_PREFIX" "$safe_run_id" \
+            "$expected_nth_run" "$prior_collected_at" || true
         else
           log "WARNING: Article load_report not found within timeout"
         fi
