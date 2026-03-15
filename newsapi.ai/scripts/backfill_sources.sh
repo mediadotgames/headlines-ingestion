@@ -88,6 +88,10 @@ get_lambda_env() {
 merge_lambda_env() {
   local fn="$1"
   local overrides="$2"
+
+  # Ensure Lambda is not in a pending update state before modifying
+  wait_for_lambda_ready "$fn"
+
   local current
   current="$(get_lambda_env "$fn")"
   local merged
@@ -98,11 +102,12 @@ merge_lambda_env() {
     --environment "{\"Variables\": $merged}" \
     --output json > /dev/null
 
-  wait_for_lambda_update "$fn"
+  wait_for_lambda_ready "$fn"
 }
 
-# Poll until Lambda update finishes (replaces 'aws lambda wait' which can hang)
-wait_for_lambda_update() {
+# Poll until Lambda is ready (LastUpdateStatus=Successful).
+# Call before AND after update-function-configuration to avoid hanging.
+wait_for_lambda_ready() {
   local fn="$1"
   local max_attempts=30   # 30 × 2s = 60s max
   local attempt=0
@@ -135,7 +140,7 @@ restore_lambda_env() {
       --function-name "$fn" \
       --environment "{\"Variables\": $env_json}" \
       --output json > /dev/null
-    wait_for_lambda_update "$fn"
+    wait_for_lambda_ready "$fn"
     log "Restored $fn env vars from snapshot"
   fi
 }
