@@ -226,8 +226,8 @@ poll_for_event_completion() {
   local expected_nth_run="$4"
 
   # Event artifacts go under:
-  # ARTIFACT_PREFIX/ingestion_source=newsapi-ai-events/parent_run_id=<safe_run_id>/parent_run_type=backfill/nth_run=<N>/
-  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/nth_run=${expected_nth_run}/"
+  # ARTIFACT_PREFIX/ingestion_source=newsapi-ai-events/parent_run_id=<safe_run_id>/parent_run_type=backfill/parent_nth_run=<N>/collected_at=<ts>/
+  local s3_prefix="${artifact_prefix}/ingestion_source=newsapi-ai-events/parent_run_id=${safe_run_id}/parent_run_type=backfill/parent_nth_run=${expected_nth_run}/"
 
   local elapsed=0
   while (( elapsed < POLL_TIMEOUT_SECONDS )); do
