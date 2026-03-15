@@ -271,13 +271,18 @@ async function upsertPipelineRunMetrics(
   nthRun: number,
   stage: "event_collect",
   metrics: Array<{ metric_name: string; metric_value: number }>,
+  stageStartedAt: string,
+  stageCompletedAt: string,
 ) {
   if (metrics.length === 0) return;
+
+  const startIdx = metrics.length * 2 + 6;
+  const endIdx = startIdx + 1;
 
   const valuesSql = metrics
     .map(
       (_, idx) =>
-        `($1::timestamptz, $2::text, $3::text, $4::integer, $5::text, $${idx * 2 + 6}::text, $${idx * 2 + 7}::bigint)`,
+        `($1::timestamptz, $2::text, $3::text, $4::integer, $5::text, $${idx * 2 + 6}::text, $${idx * 2 + 7}::bigint, $${startIdx}::timestamptz, $${endIdx}::timestamptz)`,
     )
     .join(", ");
 
@@ -285,15 +290,19 @@ async function upsertPipelineRunMetrics(
   for (const m of metrics) {
     params.push(m.metric_name, m.metric_value);
   }
+  params.push(stageStartedAt, stageCompletedAt);
 
   await db.query(
     `
     INSERT INTO public.pipeline_run_metrics (
-      run_id, ingestion_source, run_type, nth_run, stage, metric_name, metric_value
+      run_id, ingestion_source, run_type, nth_run, stage, metric_name, metric_value, stage_started_at, stage_completed_at
     )
     VALUES ${valuesSql}
     ON CONFLICT (run_id, ingestion_source, run_type, nth_run, stage, metric_name)
-    DO UPDATE SET metric_value = EXCLUDED.metric_value
+    DO UPDATE SET
+      metric_value = EXCLUDED.metric_value,
+      stage_started_at = EXCLUDED.stage_started_at,
+      stage_completed_at = EXCLUDED.stage_completed_at
     `,
     params,
   );
@@ -336,6 +345,7 @@ function buildEventDiscoveryQuery(): string {
 }
 
 export const handler = async (event: any) => {
+  const stageStartedAtIso = new Date().toISOString();
   console.log("event_collector_lambda triggered");
   console.log(JSON.stringify(event, null, 2));
 
@@ -524,6 +534,7 @@ export const handler = async (event: any) => {
     console.log("final fetched/deduped events:", deduped.length);
 
     // ── Pipeline run metrics ────────────────────────────────────
+    const stageCompletedAtIso = new Date().toISOString();
     await upsertPipelineRunMetrics(
       db,
       parentRun.run_id,
@@ -549,6 +560,8 @@ export const handler = async (event: any) => {
           metric_value: deduped.length,
         },
       ],
+      stageStartedAtIso,
+      stageCompletedAtIso,
     );
 
     // ── Write artifacts to /tmp ─────────────────────────────────
