@@ -201,10 +201,10 @@ poll_for_article_load_report() {
 
     sleep "$POLL_INTERVAL_SECONDS"
     elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
-    log "  Polling article load_report... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)"
+    log "  Polling article load_report... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
   done
 
-  log "  TIMEOUT waiting for article load_report.json"
+  log "  TIMEOUT waiting for article load_report.json" >&2
   return 1
 }
 
@@ -232,17 +232,17 @@ poll_for_event_completion() {
         | grep 'load_reports/' || true)"
 
       if [[ -n "$event_load_report" ]]; then
-        log "  Event pipeline complete"
+        log "  Event pipeline complete" >&2
         return 0
       fi
     fi
 
     sleep "$POLL_INTERVAL_SECONDS"
     elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
-    log "  Polling event completion... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)"
+    log "  Polling event completion... (${elapsed}s / ${POLL_TIMEOUT_SECONDS}s)" >&2
   done
 
-  log "  TIMEOUT waiting for event pipeline completion"
+  log "  TIMEOUT waiting for event pipeline completion" >&2
   return 1
 }
 
