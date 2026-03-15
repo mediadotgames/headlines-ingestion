@@ -98,7 +98,30 @@ merge_lambda_env() {
     --environment "{\"Variables\": $merged}" \
     --output json > /dev/null
 
-  aws lambda wait function-updated --function-name "$fn"
+  wait_for_lambda_update "$fn"
+}
+
+# Poll until Lambda update finishes (replaces 'aws lambda wait' which can hang)
+wait_for_lambda_update() {
+  local fn="$1"
+  local max_attempts=30   # 30 × 2s = 60s max
+  local attempt=0
+  while (( attempt < max_attempts )); do
+    local status
+    status="$(aws lambda get-function-configuration \
+      --function-name "$fn" \
+      --query 'LastUpdateStatus' --output text 2>/dev/null)"
+    case "$status" in
+      Successful) return 0 ;;
+      Failed)
+        log "ERROR: Lambda update failed for $fn"
+        return 1 ;;
+    esac
+    (( attempt++ ))
+    sleep 2
+  done
+  log "ERROR: Timed out waiting for $fn update (${max_attempts}×2s)"
+  return 1
 }
 
 # Restore Lambda env from snapshot
@@ -112,7 +135,7 @@ restore_lambda_env() {
       --function-name "$fn" \
       --environment "{\"Variables\": $env_json}" \
       --output json > /dev/null
-    aws lambda wait function-updated --function-name "$fn"
+    wait_for_lambda_update "$fn"
     log "Restored $fn env vars from snapshot"
   fi
 }
