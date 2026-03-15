@@ -308,17 +308,17 @@ review_gate() {
   local current_date="$1"
   local dates_remaining="$2"
 
-  echo "  Dates remaining after this one: $dates_remaining"
-  echo ""
-  echo "  ┌─────────────────────────────────────────────────────────┐"
-  echo "  │  REVIEW GATE for $current_date                       │"
-  echo "  │                                                         │"
-  echo "  │  [y] Approve and continue to next date                  │"
-  echo "  │  [r] Retry this date                                    │"
-  echo "  │  [s] Skip this date and move to next                    │"
-  echo "  │  [q] Quit backfill (restore Lambda configs)             │"
-  echo "  └─────────────────────────────────────────────────────────┘"
-  echo ""
+  echo "  Dates remaining after this one: $dates_remaining" >&2
+  echo "" >&2
+  echo "  ┌─────────────────────────────────────────────────────────┐" >&2
+  echo "  │  REVIEW GATE for $current_date                       │" >&2
+  echo "  │                                                         │" >&2
+  echo "  │  [y] Approve and continue to next date                  │" >&2
+  echo "  │  [r] Retry this date                                    │" >&2
+  echo "  │  [s] Skip this date and move to next                    │" >&2
+  echo "  │  [q] Quit backfill (restore Lambda configs)             │" >&2
+  echo "  └─────────────────────────────────────────────────────────┘" >&2
+  echo "" >&2
 
   while true; do
     read -rp "  Decision for $current_date [y/r/s/q]: " choice
@@ -327,7 +327,7 @@ review_gate() {
       r|retry)   echo "retry";   return ;;
       s|skip)    echo "skip";    return ;;
       q|quit)    echo "quit";    return ;;
-      *)         echo "  Invalid choice. Enter y, r, s, or q." ;;
+      *)         echo "  Invalid choice. Enter y, r, s, or q." >&2 ;;
     esac
   done
 }
