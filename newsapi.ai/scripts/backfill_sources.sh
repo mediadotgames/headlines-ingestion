@@ -122,7 +122,7 @@ wait_for_lambda_ready() {
         log "ERROR: Lambda update failed for $fn"
         return 1 ;;
     esac
-    (( attempt++ ))
+    attempt=$(( attempt + 1 ))
     sleep 2
   done
   log "ERROR: Timed out waiting for $fn update (${max_attempts}×2s)"
@@ -448,8 +448,8 @@ main() {
   # Snapshot current configs
   snapshot_configs
 
-  # Set up trap for cleanup on exit/interrupt
-  trap cleanup INT TERM
+  # Set up trap for cleanup on any exit (error, interrupt, or normal)
+  trap cleanup EXIT
 
   # Build date list
   local dates=()
@@ -615,7 +615,7 @@ ENVJSON
           echo ""
           log "Backfill aborted. Completed=$completed Skipped=$skipped Remaining=$remaining"
           # Disable the trap since we already restored
-          trap - INT TERM
+          trap - EXIT
           exit 0
           ;;
       esac
@@ -668,11 +668,11 @@ ENVJSON
 )"
     log "Production source list updated to 25 sources"
     # Disable the trap since we've done our own update (not restoring snapshot)
-    trap - INT TERM
+    trap - EXIT
   else
     log "Restoring original configs (not updating source list)..."
     restore_configs
-    trap - INT TERM
+    trap - EXIT
   fi
 
   # Summary
