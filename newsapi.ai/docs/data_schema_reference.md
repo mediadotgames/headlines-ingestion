@@ -6,6 +6,121 @@ The current model keeps the raw upstream EventRegistry / NewsAPI.ai payloads on 
 
 ---
 
+# Table: public.anomalies
+
+Tracks anomalous news patterns flagged by automated detection or manual reporting.
+
+## Primary Key
+
+```sql
+anomaly_id uuid primary key default gen_random_uuid()
+```
+
+## Columns
+
+| Column | Type | Description |
+| --- | --- | --- |
+| anomaly_id | uuid | Unique anomaly identifier (auto-generated) |
+| summary | text | Human-readable description of the anomaly |
+| report_time | timestamptz | When the anomaly was reported (UTC) |
+| category | anomaly_category | `Saturation Event`, `Ignored Policy Proposals`, `Ignored Human Rights Violation` |
+| severity | anomaly_severity | `Low`, `Medium`, `High`, `Critical` |
+| reporter | text | Reporting agent (`bots@...` or username) |
+| tags | text[] | Freeform tags |
+| outlets | text[] | Outlet identifiers involved |
+| resolution_status | anomaly_resolution_status | `Pending`, `Validated`, `Invalidated` |
+| investigator | text | Assigned investigator (optional) |
+| added_context | text | Community notes / additional context (optional) |
+| created_at | timestamptz | Row creation timestamp |
+| updated_at | timestamptz | Row update timestamp |
+
+## Indexes
+
+| Name | Definition |
+| --- | --- |
+| `idx_anomalies_report_time` | btree (`report_time`) |
+| `idx_anomalies_resolution_status` | btree (`resolution_status`) |
+| `idx_anomalies_tags_gin` | GIN (`tags`) |
+| `idx_anomalies_outlets_gin` | GIN (`outlets`) |
+
+---
+
+# Table: public.outlets
+
+Canonical outlet dimension tracking news organizations and their metadata.
+
+## Primary Key
+
+```sql
+id text primary key
+```
+
+## Columns
+
+| Column | Type | Description |
+| --- | --- | --- |
+| id | text | Outlet identifier |
+| name | text | Display name (unique) |
+| description | text | Outlet description |
+| url | text | Outlet website URL (unique) |
+| category | text | Outlet category |
+| language | text | Primary language |
+| country | text | Country of origin |
+| list1 | boolean | Permanent White House Press Credentials |
+| wh_2022 | boolean | White House credentials 2022 |
+| wh_2025 | boolean | White House credentials 2025 |
+| list2 | boolean | Global bureaus |
+| wire | boolean | Wire service |
+| global | boolean | Global outlet |
+| state_funded | boolean | State-funded outlet |
+| list3 | boolean | Shapes public opinion |
+| api_access | api_access_type | `Free`, `Paid`, `No API`, `Pending` |
+| paywall | paywall_type | `Hard`, `Soft`, `No Paywall`, `Pending` |
+| active | boolean | Whether outlet is actively tracked |
+| created_at | timestamptz | Row creation timestamp |
+| updated_at | timestamptz | Row update timestamp |
+
+---
+
+# Table: public.headlines
+
+Legacy headline table from the original NewsAPI.org ingestion pipeline.
+
+## Primary Key
+
+```sql
+url text primary key
+```
+
+## Columns
+
+| Column | Type | Description |
+| --- | --- | --- |
+| id | text | Stable identifier (auto-generated UUID) |
+| source_id | text | Upstream source identifier |
+| source_name | text | Display name of the source |
+| author | text | Article author |
+| title | text | Headline text |
+| description | text | Article description/snippet |
+| url | text | Canonical article URL |
+| url_to_image | text | Featured image URL |
+| published_at | timestamptz | Article publication timestamp |
+| content | text | Article content |
+| public_interest_score | integer | Computed public interest score |
+| material_impact | boolean | Material impact flag |
+| institutional_action | boolean | Institutional action flag |
+| scope_scale | boolean | Scope/scale flag |
+| new_information | boolean | New information flag |
+| topic_id | uuid | Topic cluster identifier |
+| run_id | timestamptz | Logical ingestion run identifier |
+| collected_at | timestamptz | Time collector retrieved the article |
+| ingested_at | timestamptz | Time loader inserted the row |
+| ingestion_source | text | Source pipeline (`newsapi-org`, `rss`, `scraper`) |
+| created_at | timestamptz | Row creation timestamp |
+| updated_at | timestamptz | Row update timestamp |
+
+---
+
 # Table: public.newsapi_articles
 
 This is the primary warehouse table for ingested NewsAPI.ai articles.
@@ -26,20 +141,20 @@ Each row represents one canonical article identified by the upstream article URI
 | url | text | Canonical article URL |
 | title | text | Article headline |
 | body | text | Article body text |
-| date | date | Article publication date |
-| time | time | Article publication time |
-| date_time | timestamptz | Parsed article timestamp |
-| date_time_published | timestamptz | Upstream published timestamp |
+| date | date | Date when EventRegistry serialized the article (monotonically increasing; **not** the actual publish date) |
+| time | time | Time (UTC) when EventRegistry serialized the article |
+| date_time | timestamptz | Combined `date`+`time`; when EventRegistry serialized the article (monotonically increasing) |
+| date_time_published | timestamptz | When the article was first discovered in RSS feeds; closer to the actual publication time but **not** monotonically increasing |
 | lang | text | Language code |
 | is_duplicate | boolean | Duplicate flag from upstream |
 | data_type | text | Upstream article type (`news`, `blog`, `pr`) |
 | sentiment | double precision | Upstream sentiment score |
 | event_uri | text | Upstream event identifier |
-| relevance | integer | Upstream relevance score |
+| relevance | integer | Query-match quality score from upstream |
 | story_uri | text | Upstream story identifier |
 | image | text | Article image URL |
-| sim | double precision | Upstream similarity metric |
-| wgt | bigint | Upstream weight |
+| sim | double precision | Cosine similarity to the assigned event centroid |
+| wgt | bigint | Internal upstream sorting parameter; not for analytical use |
 
 ## Raw Upstream JSONB Fields
 
@@ -53,7 +168,7 @@ These are preserved on the article row as the raw upstream snapshot.
 | concepts | jsonb | Upstream concept array |
 | links | jsonb | URLs referenced inside the article |
 | videos | jsonb | Videos extracted from the article |
-| shares | jsonb | Social media share counts |
+| shares | jsonb | Social platform share counts (facebook, googlePlus, pinterest, linkedIn) |
 | duplicate_list | jsonb | URIs of duplicate articles |
 | extracted_dates | jsonb | Dates detected in article text |
 | location | jsonb | Geographic location extracted from article |
@@ -268,7 +383,7 @@ uri text primary key
 | relevance | integer | | | Upstream relevance score |
 | event_date | date | | | Date the event occurred |
 | sentiment | double precision | | | Upstream sentiment score |
-| social_score | double precision | | | Upstream social media score |
+| social_score | double precision | | | Aggregate social media engagement metric |
 | article_counts | jsonb | | | Per-language article count breakdown |
 | title | jsonb | | | Localized event titles |
 | summary | jsonb | | | Localized event summaries |
@@ -278,7 +393,7 @@ uri text primary key
 | location | jsonb | | | Geographic location of the event |
 | stories | jsonb | | | Story clusters within the event |
 | images | jsonb | | | Images associated with the event |
-| wgt | bigint | | | Upstream weight |
+| wgt | bigint | | | Internal upstream sorting parameter; not for analytical use |
 | raw_event | jsonb | not null | | Full original EventRegistry event payload |
 | first_collected_at | timestamptz | not null | `now()` | First time this event was fetched |
 | last_collected_at | timestamptz | not null | `now()` | Most recent time this event was fetched |
