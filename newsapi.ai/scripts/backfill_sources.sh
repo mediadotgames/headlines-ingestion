@@ -31,10 +31,10 @@ ARTICLE_COLLECTOR_FN="newsapi-ai_collector"
 EVENT_COLLECTOR_FN="event_collector"
 
 # 14 new sources to backfill
-NEW_SOURCES="axios.com,bloomberg.com,abcnews.com,cbsnews.com,us.cnn.com,latimes.com,nbcnews.com,newsweek.com,theguardian.com,thehill.com,usatoday.com,news.yahoo.com,rt.com,jpost.com"
+NEW_SOURCES="axios.com,bloomberg.com,abcnews.com,cbsnews.com,us.cnn.com,latimes.com,nbcnews.com,newsweek.com,theguardian.com,thehill.com,usatoday.com,yahoo.com,rt.com,jpost.com"
 
 # All 25 sources (post-backfill production)
-ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,news.yahoo.com,nytimes.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
+ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,yahoo.com,nytimes.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
 
 # Honolulu is UTC-10 with no DST
 HONOLULU_OFFSET_HOURS=10
