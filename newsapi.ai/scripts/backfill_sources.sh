@@ -441,7 +441,7 @@ main() {
       # safe_run_id: the end of the Honolulu day in UTC, with colons replaced
       # run_id = windowToUtc = utc_end (the end boundary)
       local safe_run_id
-      safe_run_id="$(echo "$utc_end" | sed 's/:/-/g')"
+      safe_run_id="$(echo "$utc_end" | sed 's/:/-/g; s/Z$/.000Z/')"
 
       # 2. Update article collector env vars
       log "Updating $ARTICLE_COLLECTOR_FN env vars..."
