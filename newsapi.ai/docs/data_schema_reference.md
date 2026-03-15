@@ -456,9 +456,38 @@ story_id text primary key
 
 ## Table: public.enrichment_pipeline_runs
 
-Tracks enrichment pipeline execution runs. Details TBD — table exists in live DB but is not yet fully documented.
+Tracks enrichment pipeline execution runs. Each row represents one end-to-end enrichment pass over a batch of stories.
 
-> **TODO**: Capture column definitions from live DB.
+### Primary Key
+
+```sql
+run_id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| run_id | uuid | not null | `gen_random_uuid()` | Unique run identifier |
+| started_at | timestamptz | not null | `now()` | When the run began |
+| finished_at | timestamptz | | | When the run completed (null if still running) |
+| status | text | not null | `'running'` | Run status (`running`, `completed`, `failed`) |
+| stories_selected | integer | not null | `0` | Stories picked for enrichment |
+| stories_validated | integer | not null | `0` | Stories that passed validation stage |
+| stories_clustered | integer | not null | `0` | Stories assigned to topic clusters |
+| stories_judged | integer | not null | `0` | Stories evaluated for public interest |
+| stories_scoped | integer | not null | `0` | Stories that received scope classification |
+| error_count | integer | not null | `0` | Total errors encountered during run |
+| error_details | jsonb | | | Structured error information |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `enrichment_pipeline_runs_pkey` | PRIMARY KEY btree (`run_id`) |
+| `idx_epr_started_at` | btree (`started_at` DESC) |
+| `idx_epr_status` | btree (`status`) |
 
 ---
 
@@ -714,27 +743,182 @@ Tables supporting the public interest prompt evaluation framework. Used for benc
 
 ## Table: public.pi_prompt_versions
 
-Stores versioned public interest assessment prompts for evaluation.
+Stores versioned public interest assessment prompts for evaluation. Only one version may be active at a time (enforced by partial unique index).
 
-> **TODO**: Capture column definitions from live DB.
+### Primary Key
+
+```sql
+version_id text primary key
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| version_id | text | not null | | Version identifier (e.g. `v1.0`, `v2.1`) |
+| system_prompt | text | not null | | System prompt sent to the LLM |
+| user_template | text | not null | | User message template (with placeholders for story data) |
+| description | text | | | Human-readable description of changes in this version |
+| model | text | not null | `'gpt-4o-mini'` | LLM model used for evaluation |
+| temperature | real | not null | `0.0` | Sampling temperature |
+| is_active | boolean | not null | `false` | Whether this is the currently active prompt version |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `pi_prompt_versions_pkey` | PRIMARY KEY btree (`version_id`) |
+| `idx_ppv_active` | UNIQUE btree (`is_active`) WHERE `is_active = true` |
+
+### Relationships
+
+- Referenced by `pi_eval_runs.prompt_version`
+
+---
 
 ## Table: public.pi_eval_runs
 
-Tracks individual evaluation runs of PI prompts against benchmark data.
+Tracks individual evaluation runs of PI prompts against benchmark data. Each run evaluates one prompt version against the full benchmark set and computes aggregate accuracy metrics.
 
-> **TODO**: Capture column definitions from live DB.
+### Primary Key
+
+```sql
+run_id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| run_id | uuid | not null | `gen_random_uuid()` | Unique run identifier |
+| prompt_version | text | not null | | FK to `pi_prompt_versions.version_id` |
+| model | text | not null | | LLM model used for this run |
+| temperature | real | not null | `0.0` | Sampling temperature used |
+| benchmark_size | integer | not null | | Number of benchmark stories evaluated |
+| started_at | timestamptz | not null | `now()` | When the evaluation began |
+| finished_at | timestamptz | | | When the evaluation completed |
+| accuracy | real | | | Overall accuracy (fraction correct) |
+| precision_pi | real | | | Precision for public interest classification |
+| recall_pi | real | | | Recall for public interest classification |
+| f1_pi | real | | | F1 score for public interest classification |
+| false_positive_rate | real | | | False positive rate |
+| false_negative_rate | real | | | False negative rate |
+| accuracy_material_impact | real | | | Per-criterion accuracy: material impact |
+| accuracy_institutional_action | real | | | Per-criterion accuracy: institutional action |
+| accuracy_scope_scale | real | | | Per-criterion accuracy: scope/scale |
+| accuracy_new_information | real | | | Per-criterion accuracy: new information |
+| notes | text | | | Free-text notes about the run |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `pi_eval_runs_pkey` | PRIMARY KEY btree (`run_id`) |
+| `idx_per_prompt_version` | btree (`prompt_version`, `started_at` DESC) |
+
+### Foreign Keys
+
+| Name | Definition |
+| --- | --- |
+| `pi_eval_runs_prompt_version_fkey` | `prompt_version` → `pi_prompt_versions(version_id)` |
+
+### Relationships
+
+- Referenced by `pi_eval_results.run_id`
+
+---
 
 ## Table: public.pi_eval_results
 
-Per-story evaluation results from PI prompt evaluation runs.
+Per-story evaluation results from PI prompt evaluation runs. Each row compares the LLM's assessment against human ground truth labels, recording both sides and match flags.
 
-> **TODO**: Capture column definitions from live DB.
+### Primary Key
+
+```sql
+id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| id | uuid | not null | `gen_random_uuid()` | Unique result identifier |
+| run_id | uuid | not null | | FK to `pi_eval_runs.run_id` |
+| story_id | text | not null | | Story URI evaluated |
+| llm_is_public_interest | boolean | not null | | LLM's public interest gate result |
+| llm_label | text | not null | | LLM's label (High/Moderate/Low/Not Public Interest) |
+| llm_met_count | integer | not null | | LLM's criteria met count |
+| llm_material_impact | boolean | not null | | LLM's material impact criterion |
+| llm_institutional_action | boolean | not null | | LLM's institutional action criterion |
+| llm_scope_scale | boolean | not null | | LLM's scope/scale criterion |
+| llm_new_information | boolean | not null | | LLM's new information criterion |
+| llm_reasoning | text | | | LLM's reasoning text |
+| human_is_public_interest | boolean | not null | | Human ground truth gate |
+| human_label | text | not null | | Human ground truth label |
+| human_material_impact | boolean | not null | | Human ground truth: material impact |
+| human_institutional_action | boolean | not null | | Human ground truth: institutional action |
+| human_scope_scale | boolean | not null | | Human ground truth: scope/scale |
+| human_new_information | boolean | not null | | Human ground truth: new information |
+| label_match | boolean | not null | | Whether LLM label matches human label |
+| pi_match | boolean | not null | | Whether LLM gate matches human gate |
+| criteria_match_count | integer | not null | | Number of criteria where LLM matches human (0–4) |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `pi_eval_results_pkey` | PRIMARY KEY btree (`id`) |
+| `idx_perr_run_id` | btree (`run_id`) |
+| `idx_perr_story_id` | btree (`story_id`) |
+| `idx_perr_disagreement` | btree (`run_id`) WHERE `label_match = false` |
+
+### Foreign Keys
+
+| Name | Definition |
+| --- | --- |
+| `pi_eval_results_run_id_fkey` | `run_id` → `pi_eval_runs(run_id)` |
+
+---
 
 ## Table: public.pi_benchmark_labels
 
-Ground truth labels for benchmarking PI assessment accuracy.
+Human ground truth labels for benchmarking PI assessment accuracy. Each row is one reviewer's assessment of one story. The unique constraint on `(story_id, reviewer_id)` prevents duplicate labels.
 
-> **TODO**: Capture column definitions from live DB.
+### Primary Key
+
+```sql
+id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| id | uuid | not null | `gen_random_uuid()` | Unique label identifier |
+| story_id | text | not null | | Story URI being labeled |
+| reviewer_id | text | not null | | Identifier of the human reviewer |
+| is_public_interest | boolean | not null | | Reviewer's public interest gate |
+| label | text | not null | | Reviewer's label (High/Moderate/Low/Not Public Interest) |
+| material_impact | boolean | not null | | Reviewer's material impact criterion |
+| institutional_action | boolean | not null | | Reviewer's institutional action criterion |
+| scope_scale | boolean | not null | | Reviewer's scope/scale criterion |
+| new_information | boolean | not null | | Reviewer's new information criterion |
+| notes | text | | | Reviewer notes |
+| confidence | text | | | Reviewer's self-reported confidence level |
+| labeled_at | timestamptz | not null | `now()` | When the label was recorded |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `pi_benchmark_labels_pkey` | PRIMARY KEY btree (`id`) |
+| `idx_pbl_story_id` | btree (`story_id`) |
+| `idx_pbl_reviewer_id` | btree (`reviewer_id`) |
+| `idx_pbl_story_reviewer` | UNIQUE btree (`story_id`, `reviewer_id`) |
 
 ---
 
