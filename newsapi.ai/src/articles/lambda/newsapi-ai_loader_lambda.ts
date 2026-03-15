@@ -171,6 +171,8 @@ async function upsertPipelineRunMetrics(
   ingestionSource: string,
   runType: string,
   nthRun: number,
+  stageStartedAt: string,
+  stageCompletedAt: string,
 ) {
   const res = await db.query(
     `
@@ -235,7 +237,9 @@ async function upsertPipelineRunMetrics(
       nth_run,
       stage,
       metric_name,
-      metric_value
+      metric_value,
+      stage_started_at,
+      stage_completed_at
     )
     SELECT
       $1::timestamptz,
@@ -244,14 +248,18 @@ async function upsertPipelineRunMetrics(
       $4::integer,
       'article_load'::text,
       metric_name,
-      metric_value
+      metric_value,
+      $5::timestamptz,
+      $6::timestamptz
     FROM metrics
     ON CONFLICT (run_id, ingestion_source, run_type, nth_run, stage, metric_name)
     DO UPDATE SET
-      metric_value = EXCLUDED.metric_value
+      metric_value = EXCLUDED.metric_value,
+      stage_started_at = EXCLUDED.stage_started_at,
+      stage_completed_at = EXCLUDED.stage_completed_at
     RETURNING metric_name, metric_value
     `,
-    [runId, ingestionSource, runType, nthRun],
+    [runId, ingestionSource, runType, nthRun, stageStartedAt, stageCompletedAt],
   );
 
   return res.rows as Array<{
@@ -1154,6 +1162,8 @@ export const handler = async (
       manifest.ingestion_source,
       manifest.run_type,
       manifest.nth_run,
+      loadStartedAtIso,
+      loadCompletedAtIso,
     );
     console.log("pipeline_run_metrics:", pipelineRunMetrics);
 
