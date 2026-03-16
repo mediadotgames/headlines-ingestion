@@ -24,13 +24,15 @@ High
 
 ### Background
 
-The headlines ingestion pipeline currently collects articles from 11 sources.
-We are expanding coverage to 25 sources by adding 14 new sources. Historical
+The headlines ingestion pipeline currently collects articles from 14 sources
+(the original 11 plus dailywire.com, nationalreview.com, and nypost.com which
+were backfilled independently). We are expanding coverage to 28 sources by
+adding 14 new sources. Historical
 data for the new sources needs to be backfilled from 2026-02-14 through
 2026-03-13 (Honolulu local dates, 28 days).
 
 Additionally, approximately half of the existing articles from the original
-11 sources have `event_uri` values that do not yet have corresponding rows in
+14 sources have `event_uri` values that do not yet have corresponding rows in
 the `public.events` table. The backfill will also collect these missing events.
 
 ### New Sources (14)
@@ -53,7 +55,7 @@ A bash script that uses the AWS CLI to:
      on the article collector Lambda
    - Set `EVENT_DISCOVERY_SCOPE=time_window` on the event collector Lambda so
      it discovers event_uris from **all** articles on that date (both existing
-     11-source and new 14-source), not just the current run
+     14-source and new 14-source), not just the current run
    - Invoke the article collector; the S3-triggered daisy chain handles the rest:
      article loader → event collector → event loader
    - Poll S3 for `event-load-report.json` to confirm pipeline completion
@@ -62,7 +64,7 @@ A bash script that uses the AWS CLI to:
      approves (`y`), retries the date (`r`), skips (`s`), or quits (`q`)
    - Only advances to the next date after explicit approval
 3. After all 28 days complete:
-   - Update `EVENTREGISTRY_SOURCE_URIS` to all 25 sources
+   - Update `EVENTREGISTRY_SOURCE_URIS` to all 28 sources
    - Restore `EVENT_DISCOVERY_SCOPE=parent_run` (production default)
    - Clear `BACKFILL_LOCAL_DATE`, reset `RUN_TYPE=scheduled`
 
@@ -89,8 +91,8 @@ technical plan.
 - [ ] Backfill script created and tested with a single date dry-run
 - [ ] All 28 dates (2026-02-14 through 2026-03-13) processed successfully
 - [ ] `newsapi_articles` contains articles from all 14 new sources for the date range
-- [ ] `events` table populated for event_uris discovered across all 25 sources
-- [ ] Production `EVENTREGISTRY_SOURCE_URIS` updated to include all 25 sources
+- [ ] `events` table populated for event_uris discovered across all 28 sources
+- [ ] Production `EVENTREGISTRY_SOURCE_URIS` updated to include all 28 sources
 - [ ] Lambda env vars restored to production defaults after backfill
 - [ ] No impact on the scheduled daily pipeline during or after backfill
 - [ ] Pipeline_runs table shows `status = 'loaded'` for all backfill runs
@@ -110,7 +112,7 @@ technical plan.
 4. **Post-backfill validation** — Query article and event counts by source and
    date to confirm completeness
 5. **Update production source list** — Confirm EVENTREGISTRY_SOURCE_URIS is set
-   to all 25 sources and scheduled pipeline runs correctly
+   to all 28 sources and scheduled pipeline runs correctly
 
 ---
 
