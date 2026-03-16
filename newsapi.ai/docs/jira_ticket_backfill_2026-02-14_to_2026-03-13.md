@@ -39,7 +39,7 @@ the `public.events` table. The backfill will also collect these missing events.
 
 axios.com, bloomberg.com, abcnews.com, cbsnews.com, us.cnn.com, latimes.com,
 nbcnews.com, newsweek.com, theguardian.com, thehill.com, usatoday.com,
-news.yahoo.com, rt.com, jpost.com
+yahoo.com, rt.com, jpost.com
 
 ### Estimated Volume
 

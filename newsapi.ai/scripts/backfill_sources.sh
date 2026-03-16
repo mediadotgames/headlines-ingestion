@@ -34,7 +34,7 @@ EVENT_COLLECTOR_FN="event_collector"
 NEW_SOURCES="axios.com,bloomberg.com,abcnews.com,cbsnews.com,us.cnn.com,latimes.com,nbcnews.com,newsweek.com,theguardian.com,thehill.com,usatoday.com,yahoo.com,rt.com,jpost.com"
 
 # All 28 sources (post-backfill production)
-ALL_SOURCES="abcnews.com,aljazeera.com,apnews.com,axios.com,bbc.com,bloomberg.com,cbsnews.com,dailywire.com,foxnews.com,jpost.com,latimes.com,ms.now,nationalreview.com,nbcnews.com,newsweek.com,nypost.com,yahoo.com,nytimes.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
+ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,yahoo.com,nytimes.com,nypost.com,nationalreview.com,dailywire.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
 
 # Honolulu is UTC-10 with no DST
 HONOLULU_OFFSET_HOURS=10
