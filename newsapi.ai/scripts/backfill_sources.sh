@@ -33,8 +33,8 @@ EVENT_COLLECTOR_FN="event_collector"
 # 14 new sources to backfill
 NEW_SOURCES="axios.com,bloomberg.com,abcnews.com,cbsnews.com,us.cnn.com,latimes.com,nbcnews.com,newsweek.com,theguardian.com,thehill.com,usatoday.com,yahoo.com,rt.com,jpost.com"
 
-# All 25 sources (post-backfill production)
-ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,yahoo.com,nytimes.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
+# All 28 sources (post-backfill production)
+ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,yahoo.com,nytimes.com,nypost.com,nationalreview.com,dailywire.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
 
 # Honolulu is UTC-10 with no DST
 HONOLULU_OFFSET_HOURS=10
@@ -634,18 +634,18 @@ ENVJSON
   echo "  ┌─────────────────────────────────────────────────────────┐"
   echo "  │  POST-BACKFILL: Update production source list?          │"
   echo "  │                                                         │"
-  echo "  │  This will set EVENTREGISTRY_SOURCE_URIS to all 25      │"
+  echo "  │  This will set EVENTREGISTRY_SOURCE_URIS to all 28      │"
   echo "  │  sources and restore event collector to parent_run      │"
   echo "  │  scope for normal scheduled operation.                  │"
   echo "  │                                                         │"
-  echo "  │  [y] Yes, update to 25 sources                          │"
+  echo "  │  [y] Yes, update to 28 sources                          │"
   echo "  │  [n] No, just restore original configs                  │"
   echo "  └─────────────────────────────────────────────────────────┘"
   echo ""
   read -rp "  Update production sources? [y/n]: " update_choice
 
   if [[ "${update_choice,,}" == "y" || "${update_choice,,}" == "yes" ]]; then
-    log "Updating production source list to all 25 sources..."
+    log "Updating production source list to all 28 sources..."
     merge_lambda_env "$ARTICLE_COLLECTOR_FN" "$(cat <<ENVJSON
 {
   "EVENTREGISTRY_SOURCE_URIS": "$ALL_SOURCES",
@@ -666,7 +666,7 @@ ENVJSON
 }
 ENVJSON
 )"
-    log "Production source list updated to 25 sources"
+    log "Production source list updated to 28 sources"
     # Disable the trap since we've done our own update (not restoring snapshot)
     trap - EXIT
   else
