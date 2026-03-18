@@ -307,26 +307,6 @@ type PipelineRunLoadState = {
   loadCompletedAt: string | null;
 };
 
-async function tryAcquireRunLoadLock(
-  db: Client,
-  runId: string,
-  ingestionSource: string,
-  runType: string,
-  nthRun: number,
-): Promise<boolean> {
-  const lockNamespace = "newsapi-ai_loader";
-  const lockKey = `${runId}|${ingestionSource}|${runType}|${nthRun}`;
-
-  const res = await db.query(
-    `
-    SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired
-    `,
-    [lockNamespace, lockKey],
-  );
-
-  return Boolean(res.rows[0]?.acquired);
-}
-
 async function getPipelineRunLoadState(
   db: Client,
   runId: string,
@@ -1035,44 +1015,6 @@ export const handler = async (
   try {
     await db.query("BEGIN");
     console.log("transaction_started");
-
-    const lockAcquired = await tryAcquireRunLoadLock(
-      db,
-      manifest.run_id,
-      manifest.ingestion_source,
-      manifest.run_type,
-      manifest.nth_run,
-    );
-
-    if (!lockAcquired) {
-      const skippedAtIso = new Date().toISOString();
-      const skipReport = {
-        artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
-        ingestion_source: manifest.ingestion_source,
-        run_id: manifest.run_id,
-        run_type: manifest.run_type,
-        nth_run: manifest.nth_run,
-        s3_bucket: bucket,
-        s3_prefix: runPrefix,
-        load_started_at: loadStartedAtIso,
-        load_completed_at: skippedAtIso,
-        duration_ms: Date.now() - startedMs,
-        pipeline_status: "skipped_duplicate",
-        skip_reason: "duplicate_loader_execution_in_progress",
-        request_id: requestId,
-      };
-      await db.query("ROLLBACK");
-      console.log("transaction_rolled_back_duplicate");
-      const invocationReportKey = await s3PutInvocationJson(
-        bucket,
-        runPrefix,
-        requestId,
-        skipReport,
-      );
-      console.log("duplicate_invocation_report_written:", invocationReportKey);
-      console.log("loader_skipped_duplicate_execution");
-      return;
-    }
 
     const existingState = await getPipelineRunLoadState(
       db,
