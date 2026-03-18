@@ -3,6 +3,8 @@
 
 ## Purpose
 
+> **Note (2026-03-17):** This document captures the original design rationale for concept-based clustering. The production implementation has evolved to use **spaCy NER entities (PERSON, ORG, GPE)** instead of NewsAPI concepts as the overlap signal, along with an entity-veto gate and medoid-based centroids. For the current algorithm specification, see `context/core_specs_folder/TOPIC_CLUSTERING_ALGORITHM_SPEC.md` and `context/pipelines/clustering_pipeline.md`.
+
 This document describes the design approach for clustering news articles into coherent **topics**, **stories**, and **events** using the enriched data collected by the MDG News Pipeline.
 
 The clustering layer transforms individual articles into structured narratives that allow analysis of:

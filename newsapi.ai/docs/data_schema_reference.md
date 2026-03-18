@@ -981,13 +981,13 @@ id uuid primary key default gen_random_uuid()
 | story_id | text | not null | | Story URI that was assigned |
 | topic_id | uuid | not null | | Topic cluster involved |
 | assigned_at | timestamptz | not null | `now()` | When the assignment action occurred |
-| method | text | not null | | Algorithm used (e.g. `cosine`, `composite`) |
+| method | text | not null | | Algorithm version used (e.g. `medoid_ner_v1`) |
 | similarity_to_centroid | real | | | Cosine similarity to topic centroid |
 | threshold_used | real | | | Similarity threshold applied for this decision |
-| action | text | not null | | Action taken (`assign`, `reassign`, `remove`) |
+| action | text | not null | | Action taken (`assigned_existing`, `created_new`) |
 | pipeline_run_id | uuid | | | FK to enrichment pipeline run |
 | embedding_similarity | real | | | Raw embedding similarity score |
-| concept_overlap_score | real | | | Fraction of shared concepts between story and topic |
+| concept_overlap_score | real | | | Entity overlap score (column name predates NER migration; actually stores frequency-weighted spaCy NER entity overlap, not NewsAPI concept overlap) |
 | category_match | boolean | | | Whether story's top_category matches topic's dominant_category |
 | temporal_distance_hours | real | | | Hours between story publish time and topic centroid time |
 | composite_score | real | | | Weighted combination of all signals |
