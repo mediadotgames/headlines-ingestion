@@ -162,6 +162,7 @@ function computeWindow(): {
   runIdUtc: DateTime;
   windowFromUtc: DateTime;
   windowToUtc: DateTime;
+  earlyStopFromUtc: DateTime;
   windowFromLocal: DateTime;
   windowToLocal: DateTime;
   dateStart: string;
@@ -209,6 +210,13 @@ function computeWindow(): {
   const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
 
+  // Early-stop boundary: the actual cycle start (not the extended lookback).
+  // For sub-daily cycles this is windowTo - CYCLE_HOURS; for 24h it matches windowFrom.
+  const earlyStopFromUtc =
+    CYCLE_HOURS < 24
+      ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
+      : windowFromUtc;
+
   const dateStart = windowFromUtc.toISODate();
   const dateEnd = windowToUtc.toISODate();
 
@@ -220,6 +228,7 @@ function computeWindow(): {
     runIdUtc,
     windowFromUtc,
     windowToUtc,
+    earlyStopFromUtc,
     windowFromLocal,
     windowToLocal,
     dateStart,
@@ -813,6 +822,7 @@ export const handler = async () => {
     runIdUtc,
     windowFromUtc,
     windowToUtc,
+    earlyStopFromUtc,
     windowFromLocal,
     windowToLocal,
     dateStart,
@@ -894,6 +904,7 @@ export const handler = async () => {
     if (COLLECTOR_MODE === "date_window") {
       const hardFromMs = windowFromUtc.toMillis();
       const hardToMs = windowToUtc.toMillis();
+      const earlyStopFromMs = earlyStopFromUtc.toMillis();
       let consecutiveEarlyStopQualifiedPages = 0;
 
       const seenPageFingerprints = new Set<string>();
@@ -977,10 +988,10 @@ export const handler = async () => {
           break;
         }
 
-        if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
+        if (oldestMsOnPage != null && oldestMsOnPage < earlyStopFromMs) {
           if (pageAlreadySeen || newUniqueUrisAdded === 0) {
             console.warn(
-              `page ${page}: oldest article crossed window_from, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
+              `page ${page}: oldest article crossed early-stop boundary, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
             );
             consecutiveEarlyStopQualifiedPages = 0;
           } else {

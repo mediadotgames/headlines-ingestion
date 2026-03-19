@@ -137,6 +137,7 @@ function computeWindow(): {
   runIdUtc: DateTime;
   windowFromUtc: DateTime;
   windowToUtc: DateTime;
+  earlyStopFromUtc: DateTime;
   windowFromLocal: DateTime;
   windowToLocal: DateTime;
   dateStart: string;
@@ -163,7 +164,7 @@ function computeWindow(): {
     const completedCycles = Math.floor(hoursSinceMidnight / CYCLE_HOURS);
     windowToLocal = midnight.plus({ hours: completedCycles * CYCLE_HOURS });
 
-    // 2x lookback: covers twice the cycle length
+    // 2x lookback: covers twice the cycle length for article acceptance
     const lookbackHours = CYCLE_HOURS * 2;
     windowFromLocal = windowToLocal.minus({ hours: lookbackHours });
     mode = "rolling_window";
@@ -182,6 +183,13 @@ function computeWindow(): {
   const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
 
+  // Early-stop boundary: the actual cycle start (not the extended lookback).
+  // For sub-daily cycles this is windowTo - CYCLE_HOURS; for 24h it matches windowFrom.
+  const earlyStopFromUtc =
+    CYCLE_HOURS < 24
+      ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
+      : windowFromUtc;
+
   const dateStart = windowFromUtc.toISODate();
   const dateEnd = windowToUtc.toISODate();
 
@@ -193,6 +201,7 @@ function computeWindow(): {
     runIdUtc,
     windowFromUtc,
     windowToUtc,
+    earlyStopFromUtc,
     windowFromLocal,
     windowToLocal,
     dateStart,
@@ -728,6 +737,7 @@ async function main() {
     runIdUtc,
     windowFromUtc,
     windowToUtc,
+    earlyStopFromUtc,
     windowFromLocal,
     windowToLocal,
     dateStart,
@@ -779,6 +789,7 @@ async function main() {
     if (COLLECTOR_MODE === "date_window") {
       const hardFromMs = windowFromUtc.toMillis();
       const hardToMs = windowToUtc.toMillis();
+      const earlyStopFromMs = earlyStopFromUtc.toMillis();
       let consecutiveEarlyStopQualifiedPages = 0;
       const seenPageFingerprints = new Set<string>();
       let consecutiveRepeatedPages = 0;
@@ -851,10 +862,10 @@ async function main() {
 
         if (articles.length < PAGE_SIZE) break;
 
-        if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
+        if (oldestMsOnPage != null && oldestMsOnPage < earlyStopFromMs) {
           if (pageAlreadySeen || newUniqueUrisAdded === 0) {
             console.warn(
-              `page ${page}: oldest article crossed window_from, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
+              `page ${page}: oldest article crossed early-stop boundary, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
             );
             consecutiveEarlyStopQualifiedPages = 0;
           } else {
