@@ -41,11 +41,15 @@ const ARTICLE_URI_LIST_S3_URI = (
 const ARTICLE_URI_BATCH_SIZE = Number(
   process.env.ARTICLE_URI_BATCH_SIZE ?? 100,
 );
+const CYCLE_HOURS = Number(process.env.CYCLE_HOURS ?? 24);
 
 if (!EVENTREGISTRY_API_KEY) throw new Error("Missing EVENTREGISTRY_API_KEY");
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 if (!ARTIFACT_BUCKET) throw new Error("Missing ARTIFACT_BUCKET");
 if (!ARTIFACT_PREFIX) throw new Error("Missing ARTIFACT_PREFIX");
+if (![4, 6, 24].includes(CYCLE_HOURS)) {
+  throw new Error(`Invalid CYCLE_HOURS: ${CYCLE_HOURS}. Must be 4, 6, or 24`);
+}
 if (!["scheduled", "backfill", "seed"].includes(RUN_TYPE)) {
   throw new Error(`Invalid RUN_TYPE: ${RUN_TYPE}`);
 }
@@ -158,6 +162,7 @@ function computeWindow(): {
   runIdUtc: DateTime;
   windowFromUtc: DateTime;
   windowToUtc: DateTime;
+  earlyStopFromUtc: DateTime;
   windowFromLocal: DateTime;
   windowToLocal: DateTime;
   dateStart: string;
@@ -178,7 +183,20 @@ function computeWindow(): {
     windowFromLocal = parsed;
     windowToLocal = parsed.plus({ days: 1 });
     mode = "explicit_local_date";
+  } else if (CYCLE_HOURS < 24) {
+    // Sub-daily cycle: snap to the nearest completed cycle boundary
+    const now = DateTime.now().setZone(CANON_TZ);
+    const midnight = now.startOf("day");
+    const hoursSinceMidnight = now.diff(midnight, "hours").hours;
+    const completedCycles = Math.floor(hoursSinceMidnight / CYCLE_HOURS);
+    windowToLocal = midnight.plus({ hours: completedCycles * CYCLE_HOURS });
+
+    // 2x lookback: covers twice the cycle length
+    const lookbackHours = CYCLE_HOURS * 2;
+    windowFromLocal = windowToLocal.minus({ hours: lookbackHours });
+    mode = "rolling_window";
   } else {
+    // Legacy 24h cycle: snap to Honolulu midnight, use LOOKBACK_DAYS
     windowToLocal = DateTime.now()
       .setZone(CANON_TZ)
       .startOf("day")
@@ -192,6 +210,13 @@ function computeWindow(): {
   const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
 
+  // Early-stop boundary: the actual cycle start (not the extended lookback).
+  // For sub-daily cycles this is windowTo - CYCLE_HOURS; for 24h it matches windowFrom.
+  const earlyStopFromUtc =
+    CYCLE_HOURS < 24
+      ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
+      : windowFromUtc;
+
   const dateStart = windowFromUtc.toISODate();
   const dateEnd = windowToUtc.toISODate();
 
@@ -203,6 +228,7 @@ function computeWindow(): {
     runIdUtc,
     windowFromUtc,
     windowToUtc,
+    earlyStopFromUtc,
     windowFromLocal,
     windowToLocal,
     dateStart,
@@ -781,6 +807,7 @@ export const handler = async () => {
   console.log("run_type:", RUN_TYPE);
   console.log("collector_mode:", COLLECTOR_MODE);
   console.log("backfill_local_date:", BACKFILL_LOCAL_DATE || null);
+  console.log("cycle_hours:", CYCLE_HOURS);
   console.log("lookback_days:", LOOKBACK_DAYS);
   console.log("window_end_days_ago:", WINDOW_END_DAYS_AGO);
   console.log("page_size:", PAGE_SIZE);
@@ -795,6 +822,7 @@ export const handler = async () => {
     runIdUtc,
     windowFromUtc,
     windowToUtc,
+    earlyStopFromUtc,
     windowFromLocal,
     windowToLocal,
     dateStart,
@@ -876,6 +904,7 @@ export const handler = async () => {
     if (COLLECTOR_MODE === "date_window") {
       const hardFromMs = windowFromUtc.toMillis();
       const hardToMs = windowToUtc.toMillis();
+      const earlyStopFromMs = earlyStopFromUtc.toMillis();
       let consecutiveEarlyStopQualifiedPages = 0;
 
       const seenPageFingerprints = new Set<string>();
@@ -959,10 +988,10 @@ export const handler = async () => {
           break;
         }
 
-        if (oldestMsOnPage != null && oldestMsOnPage < hardFromMs) {
+        if (oldestMsOnPage != null && oldestMsOnPage < earlyStopFromMs) {
           if (pageAlreadySeen || newUniqueUrisAdded === 0) {
             console.warn(
-              `page ${page}: oldest article crossed window_from, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
+              `page ${page}: oldest article crossed early-stop boundary, but page is suspicious (repeated=${pageAlreadySeen}, new_unique_uris_added=${newUniqueUrisAdded}); ignoring early-stop`,
             );
             consecutiveEarlyStopQualifiedPages = 0;
           } else {
@@ -1090,6 +1119,7 @@ export const handler = async () => {
       ingestion_source: INGESTION_SOURCE,
       canonical_tz: CANON_TZ,
       collector_mode: COLLECTOR_MODE,
+      cycle_hours: CYCLE_HOURS,
       run_id,
       run_type: RUN_TYPE,
       nth_run,
