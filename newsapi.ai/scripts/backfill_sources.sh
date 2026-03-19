@@ -2,15 +2,18 @@
 #
 # backfill_sources.sh
 #
-# Backfill 14 new article sources and events for a date range.
-# Runs one date at a time with an operator review gate between each.
+# Backfill new article sources and events for a date range.
+# Runs one Honolulu day at a time.
 #
 # Usage:
-#   ./scripts/backfill_sources.sh [START_DATE] [END_DATE]
+#   ./scripts/backfill_sources.sh [START_DATE] [END_DATE] [--auto]
+#
+# Options:
+#   --auto    Skip review gates and auto-approve each date
 #
 # Defaults:
-#   START_DATE = 2026-02-14
-#   END_DATE   = 2026-03-13
+#   START_DATE = 2026-02-15
+#   END_DATE   = 2026-03-19
 #
 # Prerequisites:
 #   - AWS CLI v2 configured with appropriate permissions
@@ -24,17 +27,25 @@ set -euo pipefail
 # Configuration
 # ──────────────────────────────────────────────────────────────────────
 
-START_DATE="${1:-2026-02-14}"
-END_DATE="${2:-2026-03-13}"
+AUTO_APPROVE=false
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --auto) AUTO_APPROVE=true ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+START_DATE="${POSITIONAL[0]:-2026-02-15}"
+END_DATE="${POSITIONAL[1]:-2026-03-19}"
 
 ARTICLE_COLLECTOR_FN="newsapi-ai_collector"
 EVENT_COLLECTOR_FN="event_collector"
 
-# 14 new sources to backfill
-NEW_SOURCES="axios.com,bloomberg.com,abcnews.com,cbsnews.com,us.cnn.com,latimes.com,nbcnews.com,newsweek.com,theguardian.com,thehill.com,usatoday.com,yahoo.com,rt.com,jpost.com"
+# 10 new sources to backfill
+NEW_SOURCES="cbc.ca,theglobeandmail.com,asia.nikkei.com,timesofindia.indiatimes.com,abc.net.au,channelnewsasia.com,english.news.cn,telegraph.co.uk,washingtonexaminer.com,newsmax.com"
 
-# All 28 sources (post-backfill production)
-ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,yahoo.com,nytimes.com,nypost.com,nationalreview.com,dailywire.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com"
+# All 38 sources (post-backfill production)
+ALL_SOURCES="aljazeera.com,apnews.com,axios.com,abcnews.com,bbc.com,bloomberg.com,cbsnews.com,foxnews.com,jpost.com,latimes.com,ms.now,nbcnews.com,newsweek.com,yahoo.com,nytimes.com,nypost.com,nationalreview.com,dailywire.com,politico.com,reuters.com,rt.com,scmp.com,theguardian.com,thehill.com,us.cnn.com,usatoday.com,washingtonpost.com,wsj.com,cbc.ca,theglobeandmail.com,asia.nikkei.com,timesofindia.indiatimes.com,abc.net.au,channelnewsasia.com,english.news.cn,telegraph.co.uk,washingtonexaminer.com,newsmax.com"
 
 # Honolulu is UTC-10 with no DST
 HONOLULU_OFFSET_HOURS=10
@@ -186,7 +197,8 @@ get_max_nth_run() {
 
   # List immediate "folders" under the prefix and extract nth_run values
   aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" 2>/dev/null \
-    | grep -oP 'nth_run=\K[0-9]+' \
+    | grep -o 'nth_run=[0-9]*' \
+    | sed 's/nth_run=//' \
     | sort -n \
     | tail -1 || echo "0"
 }
@@ -230,7 +242,7 @@ snapshot_event_collected_at() {
   local s3_prefix="$2"
 
   aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" 2>/dev/null \
-    | grep -oP 'collected_at=[^ /]+/' || true
+    | grep -o 'collected_at=[^ /]*/' || true
 }
 
 # Poll for event pipeline completion by watching for a NEW collected_at= folder
@@ -251,7 +263,7 @@ poll_for_event_completion() {
     # List collected_at= folders and find any new ones
     local current_folders
     current_folders="$(aws s3 ls "s3://${artifact_bucket}/${s3_prefix}" 2>/dev/null \
-      | grep -oP 'collected_at=[^ /]+/' || true)"
+      | grep -o 'collected_at=[^ /]*/' || true)"
 
     # Find new folders not in the prior snapshot
     local new_folder=""
@@ -359,6 +371,12 @@ review_gate() {
   local current_date="$1"
   local dates_remaining="$2"
 
+  if [[ "$AUTO_APPROVE" == "true" ]]; then
+    echo "  [auto] approved $current_date ($dates_remaining remaining)" >&2
+    echo "approve"
+    return
+  fi
+
   echo "  Dates remaining after this one: $dates_remaining" >&2
   echo "" >&2
   echo "  ┌─────────────────────────────────────────────────────────┐" >&2
@@ -434,7 +452,7 @@ preflight() {
 main() {
   echo ""
   echo "╔═══════════════════════════════════════════════════════════════╗"
-  echo "║           BACKFILL: 14 New Sources + Events                 ║"
+  echo "║           BACKFILL: 10 New Sources + Events                 ║"
   echo "║           Date range: $START_DATE → $END_DATE             ║"
   echo "╚═══════════════════════════════════════════════════════════════╝"
   echo ""
@@ -630,22 +648,28 @@ ENVJSON
   log "All dates processed. Starting post-backfill configuration..."
 
   # Ask operator whether to update production source list
-  echo ""
-  echo "  ┌─────────────────────────────────────────────────────────┐"
-  echo "  │  POST-BACKFILL: Update production source list?          │"
-  echo "  │                                                         │"
-  echo "  │  This will set EVENTREGISTRY_SOURCE_URIS to all 28      │"
-  echo "  │  sources and restore event collector to parent_run      │"
-  echo "  │  scope for normal scheduled operation.                  │"
-  echo "  │                                                         │"
-  echo "  │  [y] Yes, update to 28 sources                          │"
-  echo "  │  [n] No, just restore original configs                  │"
-  echo "  └─────────────────────────────────────────────────────────┘"
-  echo ""
-  read -rp "  Update production sources? [y/n]: " update_choice
+  local update_choice="n"
+  if [[ "$AUTO_APPROVE" == "true" ]]; then
+    update_choice="y"
+    log "[auto] updating production source list"
+  else
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────┐"
+    echo "  │  POST-BACKFILL: Update production source list?          │"
+    echo "  │                                                         │"
+    echo "  │  This will set EVENTREGISTRY_SOURCE_URIS to all 38      │"
+    echo "  │  sources and restore event collector to parent_run      │"
+    echo "  │  scope for normal scheduled operation.                  │"
+    echo "  │                                                         │"
+    echo "  │  [y] Yes, update to 38 sources                          │"
+    echo "  │  [n] No, just restore original configs                  │"
+    echo "  └─────────────────────────────────────────────────────────┘"
+    echo ""
+    read -rp "  Update production sources? [y/n]: " update_choice
+  fi
 
   if [[ "${update_choice,,}" == "y" || "${update_choice,,}" == "yes" ]]; then
-    log "Updating production source list to all 28 sources..."
+    log "Updating production source list to all 38 sources..."
     merge_lambda_env "$ARTICLE_COLLECTOR_FN" "$(cat <<ENVJSON
 {
   "EVENTREGISTRY_SOURCE_URIS": "$ALL_SOURCES",
@@ -666,7 +690,7 @@ ENVJSON
 }
 ENVJSON
 )"
-    log "Production source list updated to 28 sources"
+    log "Production source list updated to 38 sources"
     # Disable the trap since we've done our own update (not restoring snapshot)
     trap - EXIT
   else

@@ -185,10 +185,13 @@ function computeWindow(): {
 
   // Early-stop boundary: the actual cycle start (not the extended lookback).
   // For sub-daily cycles this is windowTo - CYCLE_HOURS; for 24h it matches windowFrom.
+  // For explicit backfill dates the window is already exactly 24h, so use windowFrom.
   const earlyStopFromUtc =
-    CYCLE_HOURS < 24
-      ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
-      : windowFromUtc;
+    BACKFILL_LOCAL_DATE
+      ? windowFromUtc
+      : CYCLE_HOURS < 24
+        ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
+        : windowFromUtc;
 
   const dateStart = windowFromUtc.toISODate();
   const dateEnd = windowToUtc.toISODate();
@@ -717,6 +720,7 @@ function toArtifactCsvRow(article: NewsApiAiArticle, nthRun: number): string {
 }
 
 async function main() {
+  console.log("══ COLLECTOR START ══");
   console.log("artifact_contract_version:", ARTIFACT_CONTRACT_VERSION);
   console.log("ingestion_source:", INGESTION_SOURCE);
   console.log("run_type:", RUN_TYPE);
@@ -751,12 +755,15 @@ async function main() {
   const window_from_local = isoOrThrow(windowFromLocal, "window_from_local");
   const window_to_local = isoOrThrow(windowToLocal, "window_to_local");
 
+  console.log("── WINDOW ──");
   console.log("mode:", mode);
   console.log("run_id:", run_id);
   console.log("window_utc:", { window_from, window_to });
   console.log("window_local:", { window_from_local, window_to_local });
+  console.log("early_stop_from:", isoOrThrow(earlyStopFromUtc, "early_stop_from"));
   console.log("date_range:", { date_start: dateStart, date_end: dateEnd });
 
+  console.log("── DATABASE ──");
   const useSSL = !DATABASE_URL.includes("localhost");
   const db = new Client({
     connectionString: DATABASE_URL,
@@ -780,6 +787,7 @@ async function main() {
 
     console.log("nth_run:", nth_run);
 
+    console.log("── FETCH ──");
     const byUri = new Map<string, NewsApiAiArticle>();
     let totalFetched = 0;
     let requestedArticleUriCount = 0;
@@ -941,7 +949,10 @@ async function main() {
     }
     const nthRun = nth_run;
 
-    console.log(`fetched=${totalFetched} deduped_by_uri=${deduped.length}`);
+    console.log("── FETCH SUMMARY ──");
+    console.log("total_fetched:", totalFetched);
+    console.log("deduped_by_uri:", deduped.length);
+    console.log("collected_at:", collected_at);
 
     await updatePipelineRunCollected(db, {
       runId: runIdUtc.toJSDate(),
@@ -1046,9 +1057,12 @@ async function main() {
       );
     }
 
+    console.log("── ARTIFACT WRITE ──");
     console.log("wrote:", outDir);
+    console.log("══ COLLECTOR COMPLETE ══");
   } catch (e: any) {
     const msg = e?.message ? String(e.message) : String(e);
+    console.error("══ COLLECTOR FAILED ══");
     console.error(e);
 
     if (nth_run != null) {

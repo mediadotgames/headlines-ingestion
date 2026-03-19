@@ -22,6 +22,13 @@ import {
   backoffDelayMs,
 } from "../../shared/retry";
 
+const _log = console.log;
+const _err = console.error;
+const _warn = console.warn;
+console.log = (...a: unknown[]) => _log("\n", ...a);
+console.error = (...a: unknown[]) => _err("\n", ...a);
+console.warn = (...a: unknown[]) => _warn("\n", ...a);
+
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const DATABASE_URL = process.env.DATABASE_URL!;
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET!;
@@ -346,8 +353,7 @@ function buildEventDiscoveryQuery(): string {
 
 export const handler = async (event: any) => {
   const stageStartedAtIso = new Date().toISOString();
-  console.log("event_collector_lambda triggered");
-  console.log(JSON.stringify(event, null, 2));
+  console.log("══ EVENT COLLECTOR START ══");
 
   // ── Resolve parent run from S3 trigger ──────────────────────────
   const record = event?.Records?.[0];
@@ -363,7 +369,7 @@ export const handler = async (event: any) => {
     return;
   }
 
-  console.log(`Reading article load report from s3://${bucket}/${key}`);
+  // trigger logged below with parent info
 
   const loadReportText = await s3GetText(bucket, key);
   const loadReport = JSON.parse(loadReportText);
@@ -389,8 +395,7 @@ export const handler = async (event: any) => {
     throw new Error(`Invalid article load report at s3://${bucket}/${key}`);
   }
 
-  console.log("Parent article run:", parentRun);
-
+  console.log(`── DISCOVER EVENT URIs ──\nparent: ${parentRun.run_type} nth=${parentRun.nth_run}`);
   // ── Database connection ─────────────────────────────────────────
   const useSSL = !DATABASE_URL.includes("localhost");
   const db = new Client({
@@ -399,7 +404,6 @@ export const handler = async (event: any) => {
     connectionTimeoutMillis: 5000,
   });
   await db.connect();
-  console.log("database_connected");
 
   try {
     // ── Discover event URIs ─────────────────────────────────────
@@ -448,8 +452,7 @@ export const handler = async (event: any) => {
     const selectedUrisRes = await db.query<ArticleSelectionRow>(discoverySql, discoveryParams);
     const allDiscoveredUris = selectedUrisRes.rows.map((r) => r.event_uri).filter(Boolean);
 
-    console.log("candidate_articles_scanned:", Number(candidateCountRes.rows[0].candidate_articles_scanned ?? 0));
-    console.log("distinct_event_uris_discovered:", allDiscoveredUris.length);
+    const scanned = Number(candidateCountRes.rows[0].candidate_articles_scanned ?? 0);
 
     // ── Freshness filter ────────────────────────────────────────
     const freshnessFilteredRes = await db.query<{ event_uri: string }>(
@@ -476,15 +479,9 @@ export const handler = async (event: any) => {
 
     const selectedEventUris = freshnessFilteredRes.rows.map((r) => r.event_uri);
 
-    console.log("distinct_event_uris_selected:", selectedEventUris.length);
-
-    // ── Fetch events from Event Registry (batched) ──────────────
-    const byUri = new Map<string, EventRegistryEvent>();
-
     const totalBatches = Math.ceil(selectedEventUris.length / EVENT_FETCH_BATCH_SIZE);
-    console.log(
-      `fetching ${selectedEventUris.length} events in ${totalBatches} batch(es) of up to ${EVENT_FETCH_BATCH_SIZE}`,
-    );
+    console.log(`── FETCH EVENTS ──\nscanned=${scanned} discovered=${allDiscoveredUris.length} selected=${selectedEventUris.length}\n${totalBatches} batch(es)`);
+    const byUri = new Map<string, EventRegistryEvent>();
 
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx += 1) {
       const batchStart = batchIdx * EVENT_FETCH_BATCH_SIZE;
@@ -531,7 +528,7 @@ export const handler = async (event: any) => {
     const deduped = Array.from(byUri.values());
     const collectedAt = new Date().toISOString();
 
-    console.log("final fetched/deduped events:", deduped.length);
+    console.log(`deduped: ${deduped.length} events`);
 
     // ── Pipeline run metrics ────────────────────────────────────
     const stageCompletedAtIso = new Date().toISOString();
@@ -592,8 +589,7 @@ export const handler = async (event: any) => {
     const csvPath = path.join(tmpDir, EVENT_DATA_FILE);
     const manifestPath = path.join(tmpDir, EVENT_MANIFEST_FILE);
 
-    console.log("tmp_dir:", tmpDir);
-    console.log("s3_run_prefix:", `s3://${ARTIFACT_BUCKET}/${s3RunPrefix}/`);
+    // S3 upload logged after completion
 
     const rows = deduped.map((e) =>
       toCsvRow({
@@ -667,19 +663,14 @@ export const handler = async (event: any) => {
       csvPath,
       "text/csv",
     );
-    console.log("uploaded:", `${s3RunPrefix}/${EVENT_DATA_FILE}`);
-
     await uploadFile(
       ARTIFACT_BUCKET,
       `${s3RunPrefix}/${EVENT_MANIFEST_FILE}`,
       manifestPath,
       "application/json",
     );
-    console.log("uploaded:", `${s3RunPrefix}/${EVENT_MANIFEST_FILE}`);
-
-    console.log("event_collector_completed_successfully");
+    console.log("══ EVENT COLLECTOR COMPLETE ══\nuploaded: csv + manifest");
   } finally {
     await db.end().catch(() => {});
-    console.log("database_connection_closed");
   }
 };
