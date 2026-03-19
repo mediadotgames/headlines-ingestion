@@ -39,11 +39,16 @@ The architecture retains raw upstream EventRegistry / NewsAPI.ai payloads as JSO
    - [pi_eval_runs](#table-publicpi_eval_runs)
    - [pi_eval_results](#table-publicpi_eval_results)
    - [pi_benchmark_labels](#table-publicpi_benchmark_labels)
-7. [Legacy / Audit Tables](#legacy--audit-tables)
+7. [Regulations.gov Tables](#regulationsgov-tables)
+   - [reg_dockets](#table-publicreg_dockets)
+   - [reg_documents](#table-publicreg_documents)
+   - [reg_comment_counts](#table-publicreg_comment_counts)
+   - [reg_collection_runs](#table-publicreg_collection_runs)
+8. [Legacy / Audit Tables](#legacy--audit-tables)
    - [headlines](#table-publicheadlines)
    - [topic_assignment_audit](#table-publictopic_assignment_audit)
-8. [Entity Relationships](#entity-relationships)
-9. [Example Queries](#example-queries)
+9. [Entity Relationships](#entity-relationships)
+10. [Example Queries](#example-queries)
 
 ---
 
@@ -922,6 +927,226 @@ id uuid primary key default gen_random_uuid()
 
 ---
 
+# Regulations.gov Tables
+
+Tables supporting federal regulatory data collection from the regulations.gov API. Managed by the `collector` service and defined in `initdb/005_regulations_gov_tables.sql`. Text primary keys match API-provided identifiers. All entity tables preserve the full API response as `raw_json` JSONB for future schema evolution.
+
+## Table: public.reg_dockets
+
+Federal regulatory dockets from the regulations.gov API (`/v4/dockets`). Each row represents one regulatory proceeding.
+
+### Primary Key
+
+```sql
+docket_id text primary key
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| docket_id | text | not null | | API-provided docket identifier (e.g. `EPA-HQ-OAR-2003-0129`) |
+| agency_id | text | not null | | Owning federal agency code |
+| docket_type | text | not null | | Docket type (`Rulemaking`, `Nonrulemaking`) |
+| title | text | | | Docket title |
+| short_title | text | | | Abbreviated title |
+| dk_abstract | text | | | Docket abstract/summary |
+| modify_date | timestamptz | | | Last modification date from the API |
+| effective_date | timestamptz | | | Effective date of the regulation |
+| keywords | text[] | | | Keywords associated with the docket |
+| rin | text | | | Regulation Identifier Number |
+| organization | text | | | Organization name |
+| category | text | | | Docket category |
+| generic | text | | | Generic field from API |
+| program | text | | | Program name |
+| petition_nbr | text | | | Petition number |
+| legacy_id | text | | | Legacy system identifier |
+| sub_type | text | | | Docket subtype |
+| sub_type2 | text | | | Secondary docket subtype |
+| field1 | text | | | Agency-specific field |
+| field2 | text | | | Agency-specific field |
+| object_id | text | | | Internal API object identifier |
+| display_properties | jsonb | | | Display configuration metadata |
+| raw_json | jsonb | not null | | Complete API response body |
+| collected_at | timestamptz | not null | `now()` | When the collector fetched this docket |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+| updated_at | timestamptz | not null | `now()` | Row update timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `reg_dockets_pkey` | PRIMARY KEY btree (`docket_id`) |
+| `idx_reg_dockets_agency_id` | btree (`agency_id`) |
+| `idx_reg_dockets_keywords_gin` | GIN (`keywords`) |
+
+### Triggers
+
+- `set_updated_at` — BEFORE UPDATE, executes `tg_set_updated_at()`
+
+### Relationships
+
+- one docket → many `reg_documents` (via `reg_documents.docket_id`)
+- one docket → many `reg_comment_counts` (where `entity_type IN ('docket_received', 'docket_posted')`)
+
+---
+
+## Table: public.reg_documents
+
+Federal regulatory documents from the regulations.gov API (`/v4/documents`). Each row represents one document (proposed rule, final rule, notice, etc.) within a docket.
+
+### Primary Key
+
+```sql
+document_id text primary key
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| document_id | text | not null | | API-provided document identifier |
+| docket_id | text | | | FK to `reg_dockets.docket_id` |
+| agency_id | text | not null | | Owning federal agency code |
+| document_type | text | not null | | Document type (`Proposed Rule`, `Rule`, `Notice`, `Public Submission`, `Other`) |
+| title | text | not null | | Document title |
+| object_id | text | not null | | Internal object ID used for the comments-counts endpoint |
+| fr_doc_num | text | | | Federal Register document number |
+| posted_date | date | not null | | Date the document was posted on regulations.gov |
+| last_modified | timestamptz | | | Last modification timestamp from the API |
+| comment_start | timestamptz | | | Comment period open date |
+| comment_end | timestamptz | | | Comment period close date |
+| open_for_comment | boolean | not null | `false` | Whether the document is currently accepting comments |
+| allow_late_comments | boolean | not null | `false` | Whether late comments are accepted |
+| within_comment_period | boolean | not null | `false` | Whether the current date is within the comment period |
+| withdrawn | boolean | not null | `false` | Whether the document has been withdrawn |
+| subtype | text | | | Document subtype |
+| raw_json | jsonb | not null | | Complete API response body |
+| collected_at | timestamptz | not null | `now()` | When the collector fetched this document |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+| updated_at | timestamptz | not null | `now()` | Row update timestamp |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `reg_documents_pkey` | PRIMARY KEY btree (`document_id`) |
+| `idx_reg_documents_docket_id` | btree (`docket_id`) |
+| `idx_reg_documents_agency_id` | btree (`agency_id`) |
+| `idx_reg_documents_posted_date` | btree (`posted_date`) |
+
+### Foreign Keys
+
+| Name | Definition |
+| --- | --- |
+| `reg_documents_docket_id_fkey` | `docket_id` → `reg_dockets(docket_id)` |
+
+### Triggers
+
+- `set_updated_at` — BEFORE UPDATE, executes `tg_set_updated_at()`
+
+### Relationships
+
+- belongs_to → `reg_dockets` (via `docket_id`)
+- one document → many `reg_comment_counts` (where `entity_type = 'document'` and `entity_id = object_id`)
+
+---
+
+## Table: public.reg_comment_counts
+
+Tracks comment counts from three distinct regulations.gov API endpoints. Uses a polymorphic `entity_type`/`entity_id` pattern with a unique constraint to store one count per entity.
+
+**Count types:**
+- `docket_received` — total comments submitted to a docket (`GET /v4/docket-comments-received-counts/{id}`)
+- `docket_posted` — publicly visible comments on a docket (`GET /v4/docket-comments-counts/{id}`)
+- `document` — comments on a specific document (`GET /v4/comments-counts/{objectId}`)
+
+> **Semantic note**: "received" = total submitted; "posted" = publicly visible. Not all submitted comments get posted.
+
+### Primary Key
+
+```sql
+id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| id | uuid | not null | `gen_random_uuid()` | Unique count record identifier |
+| entity_type | text | not null | | `docket_received`, `docket_posted`, or `document` |
+| entity_id | text | not null | | `docket_id` (for docket types) or document `object_id` (for document type) |
+| comment_count | integer | not null | | The count value |
+| collected_at | timestamptz | not null | `now()` | When the count was fetched |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+| updated_at | timestamptz | not null | `now()` | Row update timestamp |
+
+### Constraints
+
+| Name | Type | Definition |
+| --- | --- | --- |
+| `uq_reg_comment_counts_entity` | UNIQUE | (`entity_type`, `entity_id`) |
+| `chk_reg_comment_counts_type` | CHECK | `entity_type IN ('docket_received', 'docket_posted', 'document')` |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `reg_comment_counts_pkey` | PRIMARY KEY btree (`id`) |
+| `idx_reg_comment_counts_entity` | btree (`entity_type`, `entity_id`) |
+
+### Triggers
+
+- `set_updated_at` — BEFORE UPDATE, executes `tg_set_updated_at()`
+
+---
+
+## Table: public.reg_collection_runs
+
+Tracks regulations.gov collection run metadata. Supports incremental resume via `last_document_date` and captures a configuration snapshot for reproducibility.
+
+### Primary Key
+
+```sql
+run_id uuid primary key default gen_random_uuid()
+```
+
+### Columns
+
+| Column | Type | Nullable | Default | Description |
+| --- | --- | --- | --- | --- |
+| run_id | uuid | not null | `gen_random_uuid()` | Unique run identifier |
+| started_at | timestamptz | not null | `now()` | When the run began |
+| ended_at | timestamptz | | | When the run completed (null if still running) |
+| status | text | not null | `'running'` | Run status (`running`, `completed`, `failed`) |
+| documents_collected | integer | not null | `0` | Documents fetched in this run |
+| dockets_collected | integer | not null | `0` | Dockets fetched in this run |
+| comments_collected | integer | not null | `0` | Comment counts fetched in this run |
+| errors_count | integer | not null | `0` | Errors encountered during run |
+| config | jsonb | | | Snapshot of collection configuration (date range, rate limits, etc.) |
+| last_document_date | date | | | Oldest document `posted_date` from this run; used for incremental resume |
+| created_at | timestamptz | not null | `now()` | Row creation timestamp |
+| updated_at | timestamptz | not null | `now()` | Row update timestamp |
+
+### Constraints
+
+| Name | Type | Definition |
+| --- | --- | --- |
+| `chk_reg_collection_runs_status` | CHECK | `status IN ('running', 'completed', 'failed')` |
+
+### Indexes
+
+| Name | Definition |
+| --- | --- |
+| `reg_collection_runs_pkey` | PRIMARY KEY btree (`run_id`) |
+| `idx_reg_collection_runs_status` | btree (`status`) |
+
+### Triggers
+
+- `set_updated_at` — BEFORE UPDATE, executes `tg_set_updated_at()`
+
+---
+
 # Legacy / Audit Tables
 
 ## Table: public.headlines
@@ -1032,6 +1257,17 @@ pipeline_run_metrics
 outlet_bias_scores ←──join──→ enriched_headlines (via source_name)
 
 enriched_headlines = denormalized join of all the above
+
+--- regulations.gov ---
+
+reg_collection_runs          (standalone run metadata)
+
+reg_dockets
+   ├── reg_documents         (docket_id FK)
+   └── reg_comment_counts    (entity_type = 'docket_received' | 'docket_posted')
+
+reg_documents
+   └── reg_comment_counts    (entity_type = 'document', entity_id = object_id)
 ```
 
 ---
@@ -1117,4 +1353,52 @@ WHERE eh.scope_status = 'IN_SCOPE'
 GROUP BY eh.topic_label, obs.composite_bias_label
 ORDER BY article_count DESC
 LIMIT 50;
+```
+
+## Dockets with most public comments (received vs posted)
+
+```sql
+SELECT
+  d.docket_id,
+  d.agency_id,
+  d.title,
+  rcv.comment_count AS received,
+  pst.comment_count AS posted
+FROM public.reg_dockets d
+LEFT JOIN public.reg_comment_counts rcv
+  ON rcv.entity_id = d.docket_id AND rcv.entity_type = 'docket_received'
+LEFT JOIN public.reg_comment_counts pst
+  ON pst.entity_id = d.docket_id AND pst.entity_type = 'docket_posted'
+ORDER BY rcv.comment_count DESC NULLS LAST
+LIMIT 25;
+```
+
+## Documents open for comment by agency
+
+```sql
+SELECT
+  agency_id,
+  COUNT(*) AS open_documents
+FROM public.reg_documents
+WHERE open_for_comment = true
+GROUP BY agency_id
+ORDER BY open_documents DESC;
+```
+
+## Recent collection run summary
+
+```sql
+SELECT
+  run_id,
+  status,
+  started_at,
+  ended_at,
+  documents_collected,
+  dockets_collected,
+  comments_collected,
+  errors_count,
+  last_document_date
+FROM public.reg_collection_runs
+ORDER BY started_at DESC
+LIMIT 10;
 ```
