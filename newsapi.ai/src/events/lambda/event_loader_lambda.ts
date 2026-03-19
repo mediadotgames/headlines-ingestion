@@ -17,6 +17,13 @@ import {
   EVENT_CSV_HEADERS,
 } from "../shared/eventArtifactSchema";
 
+const _log = console.log;
+const _err = console.error;
+const _warn = console.warn;
+console.log = (...a: unknown[]) => _log("\n", ...a);
+console.error = (...a: unknown[]) => _err("\n", ...a);
+console.warn = (...a: unknown[]) => _warn("\n", ...a);
+
 const DATABASE_URL = process.env.DATABASE_URL!;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
@@ -548,9 +555,6 @@ async function bulkUpsertFromTemp(db: Client) {
 }
 
 export const handler = async (event: any, context: { awsRequestId?: string } = {}) => {
-  console.log("event_loader_lambda triggered");
-  console.log(JSON.stringify(event, null, 2));
-
   const requestId = context.awsRequestId ?? `manual-${Date.now()}`;
 
   // ── Resolve manifest from S3 trigger ────────────────────────────
@@ -567,9 +571,6 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
     return;
   }
 
-  console.log("loader starting");
-  console.log("bucket:", bucket);
-  console.log("manifest_key:", manifestKey);
 
   // ── Read manifest from S3 ───────────────────────────────────────
   const manifestText = await s3GetText(bucket, manifestKey);
@@ -597,16 +598,7 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
   const csvKey = `${runPrefix}${EVENT_DATA_FILE}`;
   const reportKey = `${runPrefix}${EVENT_LOAD_REPORT_FILE}`;
 
-  console.log("run_id:", manifest.run_id);
-  console.log("run_type:", manifest.run_type);
-  console.log("nth_run:", manifest.nth_run);
-  console.log("ingestion_source:", manifest.ingestion_source);
-  console.log("parent_run_id:", manifest.parent_run_id ?? "none");
-  console.log("parent_run_type:", manifest.parent_run_type ?? "");
-  console.log("parent_nth_run:", manifest.parent_nth_run ?? "");
-  console.log("events_in_manifest:", manifest.events_fetched);
-  console.log("csv_key:", csvKey);
-  console.log("report_key:", reportKey);
+  console.log(`══ EVENT LOADER START ══\n${manifest.run_type} nth=${manifest.nth_run} events=${manifest.events_fetched}`);
 
   // ── Early exit if collector produced zero events ────────────────
   if (manifest.events_fetched === 0) {
@@ -655,14 +647,11 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
     connectionTimeoutMillis: 5000,
   });
   await db.connect();
-  console.log("database_connected");
-
   const loadStartedAtIso = new Date().toISOString();
   const startedMs = Date.now();
 
   try {
     await db.query("BEGIN");
-    console.log("transaction_started");
 
     // ── Duplicate detection ───────────────────────────────────────
     const existingState = await getPipelineRunLoadState(
@@ -695,10 +684,9 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
         request_id: requestId,
       };
       await db.query("ROLLBACK");
-      console.log("transaction_rolled_back_already_loaded");
+      console.log("skipped: already loaded");
       const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, skipReport);
-      console.log("duplicate_invocation_report_written:", invocationReportKey);
-      console.log("loader_skipped_already_loaded_run");
+      console.log("duplicate_report_written");
       return;
     }
 
@@ -711,16 +699,10 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
       manifest.nth_run,
       loadStartedAtIso,
     );
-    console.log("pipeline_run_marked_load_started");
-
     await copyCsvIntoTempTable(db, csvPath);
-    console.log("csv_copied_to_temp_table");
 
     const diagnostics = await collectArtifactDiagnostics(db);
     const { rowsInArtifact, rowsAttempted } = await countArtifactRows(db);
-
-    console.log("artifact_row_counts:", { rowsInArtifact, rowsAttempted });
-    console.log(`event date range: ${diagnostics.minEventDate ?? "n/a"} → ${diagnostics.maxEventDate ?? "n/a"}`);
 
     const { rowsLoaded, dbRowsInserted, dbRowsUpdated } =
       await bulkUpsertFromTemp(db);
@@ -728,12 +710,7 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
     const dbRowsUnchanged = rowsAttempted - rowsLoaded;
     const loadCompletedAtIso = new Date().toISOString();
 
-    console.log("db_write_results:", {
-      rowsLoaded,
-      dbRowsInserted,
-      dbRowsUpdated,
-      dbRowsUnchanged,
-    });
+    console.log(`── LOAD + UPSERT ──\nrows=${rowsInArtifact} dates=${diagnostics.minEventDate ?? "?"} → ${diagnostics.maxEventDate ?? "?"}\nloaded=${rowsLoaded} ins=${dbRowsInserted} upd=${dbRowsUpdated} unch=${dbRowsUnchanged}`);
 
     // ── Pipeline run metrics ──────────────────────────────────────
     await upsertPipelineRunMetrics(
@@ -751,8 +728,6 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
       loadStartedAtIso,
       loadCompletedAtIso,
     );
-    console.log("pipeline_run_metrics_written");
-
     await setLoadCompleted(
       db,
       manifest.run_id,
@@ -764,10 +739,7 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
       dbRowsInserted,
       dbRowsUpdated,
     );
-    console.log("pipeline_run_marked_loaded");
-
     await db.query("COMMIT");
-    console.log("transaction_committed");
 
     // ── Write load report to S3 ───────────────────────────────────
     const loadReport = {
@@ -817,16 +789,14 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
     };
 
     await s3PutJson(bucket, reportKey, loadReport);
-    console.log("load_report_written:", reportKey);
 
     const invocationReportKey = await s3PutInvocationJson(bucket, runPrefix, requestId, {
       ...loadReport,
       request_id: requestId,
     });
-    console.log("invocation_report_written:", invocationReportKey);
-    console.log("event_loader_completed_successfully");
+    console.log("══ EVENT LOADER COMPLETE ══");
   } catch (e: any) {
-    console.error("event_loader_failed:", e);
+    console.error(`══ EVENT LOADER FAILED ══\n${e?.message ? String(e.message) : String(e)}`);
 
     try {
       await db.query("ROLLBACK");
@@ -859,6 +829,5 @@ export const handler = async (event: any, context: { awsRequestId?: string } = {
     }
 
     await db.end().catch(() => {});
-    console.log("database_connection_closed");
   }
 };

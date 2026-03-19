@@ -15,6 +15,13 @@ import {
   ARTIFACT_CONTRACT_VERSION,
 } from "../shared/newsapi-aiArtifactSchema";
 
+const _log = console.log;
+const _err = console.error;
+const _warn = console.warn;
+console.log = (...a: unknown[]) => _log("\n", ...a);
+console.error = (...a: unknown[]) => _err("\n", ...a);
+console.warn = (...a: unknown[]) => _warn("\n", ...a);
+
 const DATABASE_URL = process.env.DATABASE_URL!;
 if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
 
@@ -959,9 +966,7 @@ export const handler = async (
     return;
   }
 
-  console.log("loader starting");
-  console.log("bucket:", bucket);
-  console.log("manifest_key:", manifestKey);
+  console.log("══ ARTICLE LOADER START ══");
 
   const manifestText = await s3GetText(bucket, manifestKey);
   const manifest = JSON.parse(manifestText) as Manifest;
@@ -980,12 +985,7 @@ export const handler = async (
   const csvKey = `${runPrefix}articles.csv`;
   const reportKey = `${runPrefix}load_report.json`;
 
-  console.log("run_id:", manifest.run_id);
-  console.log("run_type:", manifest.run_type);
-  console.log("nth_run:", manifest.nth_run);
-  console.log("ingestion_source:", manifest.ingestion_source);
-  console.log("csv_key:", csvKey);
-  console.log("report_key:", reportKey);
+  console.log(`── LOAD CSV ──\nrun=${manifest.run_id} nth=${manifest.nth_run} ${manifest.run_type}`);
 
   const csvPath = path.join("/tmp", "articles.csv");
   await s3DownloadToFile(bucket, csvKey, csvPath);
@@ -1007,14 +1007,11 @@ export const handler = async (
   });
 
   await db.connect();
-  console.log("database_connected");
-
   const loadStartedAtIso = new Date().toISOString();
   const startedMs = Date.now();
 
   try {
     await db.query("BEGIN");
-    console.log("transaction_started");
 
     const existingState = await getPipelineRunLoadState(
       db,
@@ -1063,16 +1060,10 @@ export const handler = async (
       manifest.nth_run,
       loadStartedAtIso,
     );
-    console.log("pipeline_run_marked_load_started");
-
     await copyCsvIntoTempTable(db, csvPath);
-    console.log("csv_copied_to_temp_table");
 
     const { rowsInArtifact, rowsAttempted } = await countArtifactRows(db);
-    console.log("artifact_row_counts:", { rowsInArtifact, rowsAttempted });
-
     const diagnostics = await getArtifactDiagnostics(db);
-    console.log("artifact_diagnostics:", diagnostics);
 
     const { rowsLoaded, dbRowsInserted, dbRowsUpdated } =
       await bulkUpsertFromTemp(
@@ -1083,20 +1074,12 @@ export const handler = async (
         manifest.nth_run,
         manifest.collected_at,
       );
-    console.log("newsapi_articles_upsert_complete");
-
     await syncNormalizedArticleDimensionsFromTemp(db);
-    console.log("normalized_article_dimensions_synced");
 
     const dbRowsUnchanged = rowsAttempted - rowsLoaded;
     const loadCompletedAtIso = new Date().toISOString();
 
-    console.log("db_write_results:", {
-      rowsLoaded,
-      dbRowsInserted,
-      dbRowsUpdated,
-      dbRowsUnchanged,
-    });
+    console.log(`── UPSERT ──\nrows=${rowsInArtifact} sources=${diagnostics.populatedCounts?.source ?? "?"}\nloaded=${rowsLoaded} ins=${dbRowsInserted} upd=${dbRowsUpdated} unch=${dbRowsUnchanged}`);
 
     const pipelineRunMetrics = await upsertPipelineRunMetrics(
       db,
@@ -1107,8 +1090,7 @@ export const handler = async (
       loadStartedAtIso,
       loadCompletedAtIso,
     );
-    console.log("pipeline_run_metrics:", pipelineRunMetrics);
-
+    console.log("── COMMIT + REPORT ──");
     await setLoadCompleted(
       db,
       manifest.run_id,
@@ -1120,10 +1102,7 @@ export const handler = async (
       dbRowsInserted,
       dbRowsUpdated,
     );
-    console.log("pipeline_run_marked_loaded");
-
     await db.query("COMMIT");
-    console.log("transaction_committed");
 
     const loadReport = {
       artifact_contract_version: ARTIFACT_CONTRACT_VERSION,
@@ -1152,8 +1131,6 @@ export const handler = async (
     };
 
     await s3PutJson(bucket, reportKey, loadReport);
-    console.log("load_report_written:", reportKey);
-
     const invocationReportKey = await s3PutInvocationJson(
       bucket,
       runPrefix,
@@ -1163,10 +1140,9 @@ export const handler = async (
         request_id: requestId,
       },
     );
-    console.log("invocation_report_written:", invocationReportKey);
-    console.log("loader_completed_successfully");
+    console.log("══ ARTICLE LOADER COMPLETE ══");
   } catch (e: any) {
-    console.error("loader_failed:", e);
+    console.error(`══ ARTICLE LOADER FAILED ══\n${e?.message ? String(e.message) : String(e)}`);
 
     try {
       await db.query("ROLLBACK");
@@ -1199,6 +1175,5 @@ export const handler = async (
     }
 
     await db.end().catch(() => {});
-    console.log("database_connection_closed");
   }
 };

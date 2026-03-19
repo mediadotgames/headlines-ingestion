@@ -20,6 +20,15 @@ import {
   backoffDelayMs,
 } from "../../shared/retry.ts";
 
+// Prefix every log line with \n so the message starts on a fresh
+// line after the CloudWatch timestamp / request-id prefix.
+const _log = console.log;
+const _err = console.error;
+const _warn = console.warn;
+console.log = (...a: unknown[]) => _log("\n", ...a);
+console.error = (...a: unknown[]) => _err("\n", ...a);
+console.warn = (...a: unknown[]) => _warn("\n", ...a);
+
 const EVENTREGISTRY_API_KEY = process.env.EVENTREGISTRY_API_KEY!;
 const EVENTREGISTRY_SOURCE_URIS = (
   process.env.EVENTREGISTRY_SOURCE_URIS ?? ""
@@ -212,10 +221,13 @@ function computeWindow(): {
 
   // Early-stop boundary: the actual cycle start (not the extended lookback).
   // For sub-daily cycles this is windowTo - CYCLE_HOURS; for 24h it matches windowFrom.
+  // For explicit backfill dates the window is already exactly 24h, so use windowFrom.
   const earlyStopFromUtc =
-    CYCLE_HOURS < 24
-      ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
-      : windowFromUtc;
+    BACKFILL_LOCAL_DATE
+      ? windowFromUtc
+      : CYCLE_HOURS < 24
+        ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
+        : windowFromUtc;
 
   const dateStart = windowFromUtc.toISODate();
   const dateEnd = windowToUtc.toISODate();
@@ -801,22 +813,7 @@ function toArtifactCsvRow(article: NewsApiAiArticle, nthRun: number): string {
 }
 
 export const handler = async () => {
-  console.log("collector starting");
-  console.log("artifact_contract_version:", ARTIFACT_CONTRACT_VERSION);
-  console.log("ingestion_source:", INGESTION_SOURCE);
-  console.log("run_type:", RUN_TYPE);
-  console.log("collector_mode:", COLLECTOR_MODE);
-  console.log("backfill_local_date:", BACKFILL_LOCAL_DATE || null);
-  console.log("cycle_hours:", CYCLE_HOURS);
-  console.log("lookback_days:", LOOKBACK_DAYS);
-  console.log("window_end_days_ago:", WINDOW_END_DAYS_AGO);
-  console.log("page_size:", PAGE_SIZE);
-  console.log("max_pages:", MAX_PAGES);
-  console.log("fetch_max_attempts:", FETCH_MAX_ATTEMPTS);
-  console.log("source_uris_count:", sourceUris.length);
-  if (COLLECTOR_MODE === "date_window") {
-    console.log("source_uris:", sourceUris);
-  }
+  console.log(`══ COLLECTOR START ══\n${RUN_TYPE} | ${COLLECTOR_MODE} | ${CYCLE_HOURS}h | ${sourceUris.length} sources`);
 
   const {
     runIdUtc,
@@ -836,12 +833,7 @@ export const handler = async () => {
   const window_from_local = isoOrThrow(windowFromLocal, "window_from_local");
   const window_to_local = isoOrThrow(windowToLocal, "window_to_local");
 
-  console.log("mode:", mode);
-  console.log("run_id:", run_id);
-  console.log("window_utc:", { window_from, window_to });
-  console.log("window_local:", { window_from_local, window_to_local });
-  console.log("date_range:", { date_start: dateStart, date_end: dateEnd });
-
+  console.log(`── WINDOW ──\n${window_from_local} → ${window_to_local}\nrun_id: ${run_id}`);
   const useSSL = !DATABASE_URL.includes("localhost");
   const db = new Client({
     connectionString: DATABASE_URL,
@@ -850,8 +842,6 @@ export const handler = async () => {
   });
 
   await db.connect();
-  console.log("database_connected");
-
   let nth_run: number | null = null;
 
   try {
@@ -862,8 +852,6 @@ export const handler = async () => {
       windowFrom: windowFromUtc.toJSDate(),
       windowTo: windowToUtc.toJSDate(),
     });
-    console.log("nth_run:", nth_run);
-
     if (nth_run === null) {
       throw new Error("nth_run must not be null before artifact generation");
     }
@@ -892,9 +880,7 @@ export const handler = async () => {
       `/run_type=${RUN_TYPE}` +
       `/nth_run=${nthRun}`;
 
-    console.log("tmp_dir:", tmpDir);
-    console.log("s3_run_prefix:", `s3://${ARTIFACT_BUCKET}/${s3RunPrefix}/`);
-
+    console.log(`── FETCH ── nth_run=${nthRun}`);
     const byUri = new Map<string, NewsApiAiArticle>();
     let totalFetched = 0;
     let requestedArticleUriCount = 0;
@@ -974,13 +960,7 @@ export const handler = async () => {
         const newUniqueUrisAdded = sizeAfter - sizeBefore;
 
         console.log(
-          `page ${page}: unique_uris_in_batch=${uniquePageUris.size}`,
-        );
-        console.log(
-          `page ${page}: new_unique_uris_added=${newUniqueUrisAdded}`,
-        );
-        console.log(
-          `page ${page}: sample_uris=${JSON.stringify(pageUris.slice(0, 5))}`,
+          `page ${page}: unique=${uniquePageUris.size} new=${newUniqueUrisAdded} total=${sizeAfter}`,
         );
 
         if (articles.length < PAGE_SIZE) {
@@ -1070,13 +1050,7 @@ export const handler = async () => {
     const collectedAt = new Date();
     const collected_at = collectedAt.toISOString();
 
-    console.log("fetch_summary:", {
-      total_fetched: totalFetched,
-      deduped_by_uri: deduped.length,
-      requested_article_uri_count: requestedArticleUriCount,
-      missing_article_uri_count: missingArticleUris.length,
-      collected_at,
-    });
+    console.log(`── FETCH SUMMARY ──\nfetched=${totalFetched} deduped=${deduped.length}`);
 
     await updatePipelineRunCollected(db, {
       runId: runIdUtc.toJSDate(),
@@ -1087,8 +1061,6 @@ export const handler = async () => {
       articlesFetched: totalFetched,
       articlesDeduped: deduped.length,
     });
-    console.log("pipeline_run_marked_collected");
-
     const jsonl =
       deduped
         .map((a) =>
@@ -1176,36 +1148,10 @@ export const handler = async () => {
       );
     }
 
-    console.log("artifact_files_written:", {
-      jsonlPath,
-      csvPath,
-      manifestPath,
-      missingUriPath,
-    });
-
-    await uploadFile(
-      ARTIFACT_BUCKET,
-      `${s3RunPrefix}/articles.jsonl`,
-      jsonlPath,
-      "application/x-ndjson",
-    );
-    console.log("uploaded:", `${s3RunPrefix}/articles.jsonl`);
-
-    await uploadFile(
-      ARTIFACT_BUCKET,
-      `${s3RunPrefix}/articles.csv`,
-      csvPath,
-      "text/csv",
-    );
-    console.log("uploaded:", `${s3RunPrefix}/articles.csv`);
-
-    await uploadFile(
-      ARTIFACT_BUCKET,
-      `${s3RunPrefix}/manifest.json`,
-      manifestPath,
-      "application/json",
-    );
-    console.log("uploaded:", `${s3RunPrefix}/manifest.json`);
+    await uploadFile(ARTIFACT_BUCKET, `${s3RunPrefix}/articles.jsonl`, jsonlPath, "application/x-ndjson");
+    await uploadFile(ARTIFACT_BUCKET, `${s3RunPrefix}/articles.csv`, csvPath, "text/csv");
+    await uploadFile(ARTIFACT_BUCKET, `${s3RunPrefix}/manifest.json`, manifestPath, "application/json");
+    console.log("── S3 UPLOAD ──\nuploaded: jsonl + csv + manifest");
 
     if (COLLECTOR_MODE === "article_uri_list") {
       await uploadFile(
@@ -1214,19 +1160,11 @@ export const handler = async () => {
         missingUriPath,
         "application/json",
       );
-      console.log("uploaded:", `${s3RunPrefix}/missing_article_uris.json`);
     }
-
-    console.log("collector_completed_successfully");
+    console.log("══ COLLECTOR COMPLETE ══");
   } catch (e: any) {
     const msg = e?.message ? String(e.message) : String(e);
-    console.error("collector_failed:", {
-      message: msg,
-      run_id,
-      run_type: RUN_TYPE,
-      nth_run,
-      ingestion_source: INGESTION_SOURCE,
-    });
+    console.error(`══ COLLECTOR FAILED ══\n${msg}\nrun_id=${run_id} nth_run=${nth_run}`);
 
     if (nth_run != null) {
       try {
@@ -1247,6 +1185,5 @@ export const handler = async () => {
     throw e;
   } finally {
     await db.end().catch(() => {});
-    console.log("database_connection_closed");
   }
 };
