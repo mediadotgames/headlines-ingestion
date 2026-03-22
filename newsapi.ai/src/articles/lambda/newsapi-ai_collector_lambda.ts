@@ -76,7 +76,7 @@ if (
 }
 
 const INGESTION_SOURCE = "newsapi-ai";
-const CANON_TZ = "Pacific/Honolulu";
+const CANON_TZ = "UTC";
 const PAGE_SIZE = 100;
 const MAX_PAGES = 500;
 const FETCH_MAX_ATTEMPTS = 5;
@@ -172,62 +172,51 @@ function computeWindow(): {
   windowFromUtc: DateTime;
   windowToUtc: DateTime;
   earlyStopFromUtc: DateTime;
-  windowFromLocal: DateTime;
-  windowToLocal: DateTime;
   dateStart: string;
   dateEnd: string;
-  mode: "explicit_local_date" | "rolling_window";
+  mode: "explicit_date" | "rolling_window";
 } {
-  let windowFromLocal: DateTime;
-  let windowToLocal: DateTime;
-  let mode: "explicit_local_date" | "rolling_window";
+  let windowFromUtc: DateTime;
+  let windowToUtc: DateTime;
+  let mode: "explicit_date" | "rolling_window";
 
   if (BACKFILL_LOCAL_DATE) {
     const parsed = DateTime.fromISO(BACKFILL_LOCAL_DATE, {
-      zone: CANON_TZ,
+      zone: "UTC",
     }).startOf("day");
     if (!parsed.isValid) {
       throw new Error(`Invalid BACKFILL_LOCAL_DATE: ${BACKFILL_LOCAL_DATE}`);
     }
-    windowFromLocal = parsed;
-    windowToLocal = parsed.plus({ days: 1 });
-    mode = "explicit_local_date";
+    windowFromUtc = parsed;
+    windowToUtc = parsed.plus({ days: 1 });
+    mode = "explicit_date";
   } else if (CYCLE_HOURS < 24) {
-    // Sub-daily cycle: snap to the nearest completed cycle boundary
-    const now = DateTime.now().setZone(CANON_TZ);
+    // Sub-daily cycle: snap to the nearest completed UTC cycle boundary
+    const now = DateTime.utc();
     const midnight = now.startOf("day");
     const hoursSinceMidnight = now.diff(midnight, "hours").hours;
     const completedCycles = Math.floor(hoursSinceMidnight / CYCLE_HOURS);
-    windowToLocal = midnight.plus({ hours: completedCycles * CYCLE_HOURS });
+    windowToUtc = midnight.plus({ hours: completedCycles * CYCLE_HOURS });
 
     // 2x lookback: covers twice the cycle length
     const lookbackHours = CYCLE_HOURS * 2;
-    windowFromLocal = windowToLocal.minus({ hours: lookbackHours });
+    windowFromUtc = windowToUtc.minus({ hours: lookbackHours });
     mode = "rolling_window";
   } else {
-    // Legacy 24h cycle: snap to Honolulu midnight, use LOOKBACK_DAYS
-    windowToLocal = DateTime.now()
-      .setZone(CANON_TZ)
+    // 24h cycle: snap to UTC midnight
+    windowToUtc = DateTime.utc()
       .startOf("day")
       .minus({ days: WINDOW_END_DAYS_AGO });
 
-    windowFromLocal = windowToLocal.minus({ days: LOOKBACK_DAYS });
+    windowFromUtc = windowToUtc.minus({ days: LOOKBACK_DAYS });
     mode = "rolling_window";
   }
 
-  const windowToUtc = windowToLocal.toUTC();
-  const windowFromUtc = windowFromLocal.toUTC();
   const runIdUtc = windowToUtc;
 
-  // Early-stop boundary: the actual cycle start (not the extended lookback).
-  // For sub-daily cycles this is windowTo - CYCLE_HOURS; for 24h it matches windowFrom.
-  // For explicit backfill dates the window is already exactly 24h, so use windowFrom.
-  const earlyStopFromUtc =
-    BACKFILL_LOCAL_DATE
-      ? windowFromUtc
-      : CYCLE_HOURS < 24
-        ? windowToLocal.minus({ hours: CYCLE_HOURS }).toUTC()
-        : windowFromUtc;
+  // Early-stop boundary: matches the acceptance window (windowFrom).
+  // Paginate until we've passed the full lookback, not just the current cycle.
+  const earlyStopFromUtc = windowFromUtc;
 
   const dateStart = windowFromUtc.toISODate();
   const dateEnd = windowToUtc.toISODate();
@@ -241,8 +230,6 @@ function computeWindow(): {
     windowFromUtc,
     windowToUtc,
     earlyStopFromUtc,
-    windowFromLocal,
-    windowToLocal,
     dateStart,
     dateEnd,
     mode,
@@ -255,6 +242,14 @@ function jsonString(value: unknown): string {
 
 function parseArticleDateMs(article: NewsApiAiArticle): number | null {
   const raw = article.dateTimePub ?? article.dateTime ?? null;
+  if (!raw) return null;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** Uses dateTime (index time) to match EventRegistry's sort order. */
+function parseArticleSortDateMs(article: NewsApiAiArticle): number | null {
+  const raw = article.dateTime ?? article.dateTimePub ?? null;
   if (!raw) return null;
   const ms = new Date(raw).getTime();
   return Number.isFinite(ms) ? ms : null;
@@ -820,8 +815,6 @@ export const handler = async () => {
     windowFromUtc,
     windowToUtc,
     earlyStopFromUtc,
-    windowFromLocal,
-    windowToLocal,
     dateStart,
     dateEnd,
     mode,
@@ -830,10 +823,8 @@ export const handler = async () => {
   const run_id = isoOrThrow(runIdUtc, "run_id");
   const window_from = isoOrThrow(windowFromUtc, "window_from");
   const window_to = isoOrThrow(windowToUtc, "window_to");
-  const window_from_local = isoOrThrow(windowFromLocal, "window_from_local");
-  const window_to_local = isoOrThrow(windowToLocal, "window_to_local");
 
-  console.log(`── WINDOW ──\n${window_from_local} → ${window_to_local}\nrun_id: ${run_id}`);
+  console.log(`── WINDOW ──\nmode: ${mode}\n${window_from} → ${window_to}\nrun_id: ${run_id}\nearly_stop_from: ${isoOrThrow(earlyStopFromUtc, "early_stop_from")}\ndate_range: ${dateStart} → ${dateEnd}`);
   const useSSL = !DATABASE_URL.includes("localhost");
   const db = new Client({
     connectionString: DATABASE_URL,
@@ -943,14 +934,15 @@ export const handler = async () => {
           const uri = article.uri == null ? "" : String(article.uri).trim();
           if (!uri) continue;
 
-          const articleMs = parseArticleDateMs(article);
-          if (articleMs != null) {
-            if (oldestMsOnPage == null || articleMs < oldestMsOnPage) {
-              oldestMsOnPage = articleMs;
-            }
-            if (articleMs < hardFromMs || articleMs >= hardToMs) {
-              continue;
-            }
+          // Track oldest by dateTime (index time) to align with API sort order
+          const sortMs = parseArticleSortDateMs(article);
+          if (sortMs != null && (oldestMsOnPage == null || sortMs < oldestMsOnPage)) {
+            oldestMsOnPage = sortMs;
+          }
+
+          // Filter by dateTime (index time) to match API's view of which day an article belongs to
+          if (sortMs != null && (sortMs < hardFromMs || sortMs >= hardToMs)) {
+            continue;
           }
 
           byUri.set(uri, article);
@@ -1098,8 +1090,6 @@ export const handler = async () => {
       window_from,
       window_to,
       collected_at,
-      window_from_local,
-      window_to_local,
       source_uris: COLLECTOR_MODE === "date_window" ? sourceUris : [],
       lang: "eng",
       articles_fetched: totalFetched,
@@ -1118,7 +1108,7 @@ export const handler = async () => {
         service: "EventBridge Scheduler",
         timezone: CANON_TZ,
         time: "00:05",
-        note: "Runs shortly after Honolulu midnight so the full USA day including Hawaii is complete.",
+        note: "Runs shortly after UTC midnight so the full day is complete.",
       },
     };
 
